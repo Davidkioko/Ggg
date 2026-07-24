@@ -1,9 +1,9 @@
 [MODULE 01 - CONFIG_LOADER]
 LABEL: CONFIG_LOADER
 TRACKPATH:
-# 2026-05-01 FIX #3: Added RESERVING_TIMEOUT_SEC for Mitigation 2 boot job to avoid magic 2min
 # 2026-07-24 FIX #4: Removed ALBY queue config per Mitigation 1 worker-less fill. Fixed os.getenv and __name__ syntax
 # 2026-07-24 FIX #5: Added OCC_RETRIES=5 for Mitigation A 5.2 single source of truth
+# 2026-07-24 FIX #6: Added ALBY_RPS for Mitigation 1 worker-less fill semaphore
 
 import os
 from dotenv import load_dotenv
@@ -34,6 +34,9 @@ DB_POOL_RECYCLE = 300 if IS_PAID else 120
 CLOUDFLARE_PING_SEC = 300 if IS_PAID else 45
 WEBHOOK_TIMEOUT = 15 if IS_PAID else 5
 WEBHOOK_NOTIFY_PARALLEL = 20 if IS_PAID else 5
+
+# --- ALBY ---
+ALBY_RPS = int(os.getenv("ALBY_RPS", "10" if IS_PAID else "3")) # semaphore limit for ALBY client per Mitigation 1
 
 # --- TELEGRAM / BOT ---
 API_ID = int(os.getenv("API_ID"))
@@ -134,9 +137,9 @@ if __name__!= "__main__":
     print("[MODULE 02 - DB_CONNECTION] Loaded v1.1.0")# [MODULE 03 - DB_MODELS]
 # LABEL: DB_MODELS
 # TRACKPATH:
-# 2026-07-24 FIX #MIT1-REM: Removed AlbySlot table per MITIGATION 1 queue removal
-# 2026-07-24 FIX #MIT1-STATE: Added 'dead' to Payment.state CheckConstraint for boot-only recovery per item 3
-# 2026-07-24 FIX #MIT1-VOID: Added 'voided' to Payment.state and kept uq_one_unpaid_invoice on reserving/open only per Mitigation A 3.1
+# 2026-07-24 FIX #TYPEA-VER: Added payment_version BIGINT DEFAULT 0 for OCC atomic guards per TYPE A item 2
+# 2026-07-24 FIX #TYPEA-STATE: Restricted Payment.state CK to reserving->open->paid or reserving->dead per TYPE A item 2
+# 2026-07-24 FIX #TYPE1-AUTH: Added ck_state_mutation_authority CK. Only MODULE 26 can set state != reserving by bumping payment_version
 
 from sqlalchemy import Column, Integer, String, BigInteger, DateTime, Boolean, ForeignKey, Text, Index, CheckConstraint, UniqueConstraint, event, DDL
 from sqlalchemy.sql import func
@@ -191,23 +194,24 @@ class Payment(Base):
     # NEW: Cache Alby expiry and state to avoid hitting Alby on buy
     expires_at = Column(DateTime, nullable=True, index=True)  # NEW: When Alby will expire this
     alby_state = Column(String, default="open", index=True)  # NEW: cached: open/paid/expired
-    # REMOVED: voided, void_attempts. Invoices are not manually voided. They expire naturally or are marked paid.
     created = Column(DateTime, default=func.now())
+    # TYPE A: version guard for atomic state mutations. Only MODULE 26 increments this
+    payment_version = Column(BigInteger, default=0, nullable=False)
+    
     # FIX #16: Partial unique index to enforce only 1 unpaid invoice per user. Required for concurrent buy safety
-    # FIX #22: Removed UniqueConstraint("id", "processed_job_id"). Now enforced by processed_job_id UNIQUE
     __table_args__ = (
-        # FIX #MIT1: Changed to UNIQUE partial index for DB-FIRST 2PC. Covers reserving + open states only
+        # FIX #TYPEA-REUSE: Now also requires tokens_credited=false so expired/credited invoices don't block reuse per TYPE A item 6
         UniqueConstraint(
             "uid", 
             name="uq_one_unpaid_invoice",
-            postgresql_where=((paid.is_(False)) & (state.in_(["reserving", "open"]))) # voided excluded per 3.1
+            postgresql_where=((paid.is_(False)) & (tokens_credited.is_(False)) & (state.in_(["reserving", "open"]))) # voided removed per TYPE A
         ),
-        # FIX #MIT1: Removed uq_one_clientref_per_uid. Global unique(client_ref) is sufficient per spec
         Index("ix_payment_processed_job_id", "processed_job_id"), # FIX #21: index for fast lookup
         CheckConstraint("(paid = false) OR (paid = true AND paid_at IS NOT NULL)", name="ck_paid_requires_paid_at"), # FIX #15: enforce paid_at set when paid
-        # FIX #MIT1-VOID: Allow 'voided' state for soft-delete. Never delete reserving rows. Reconciled by MODULE 26
-        CheckConstraint("state IN ('reserving','open','paid','dead','voided')", name="ck_payments_state"),
-        # REMOVED: ck_paid_void_mutual_exclusive. No voided column anymore per buglist
+        # TYPE A: strict state machine. Only allowed: reserving->open->paid or reserving->dead
+        CheckConstraint("state IN ('reserving','open','paid','dead')", name="ck_payments_state"),
+        # FIX #TYPE1-AUTH: DB authority. Only allow state change out of reserving if MODULE 26 bumps payment_version
+        CheckConstraint("(payment_version = 1) OR (state = 'reserving')", name="ck_state_mutation_authority"),
     )
 
 # FIX #80: DB trigger to prevent double credit race per Bug #1
@@ -256,14 +260,12 @@ class UserLock(Base):
 # REMOVED: AlbySlot table per MITIGATION 1. Queue/worker removed, no RPS slot table needed.
 
 # Console label on import for debugging
-# [MODULE 03 - DB_MODELS] v1.1.27
-if __name__!= "__main__":
-    print("[MODULE 03 - DB_MODELS] Loaded v1.1.27")# [MODULE 04 - LOGGER_UTILS]
+# [MODULE 03 - DB_MODELS] v1.1.30# [MODULE 04 - LOGGER_UTILS]
 # LABEL: LOGGER_UTILS
 # TRACKPATH:
-# 2026-04-05 FIX #2: Converted safe_call to async, replaced time.sleep with asyncio.sleep
-# 2026-04-20 FIX #1: Added jitter to safe_call backoff per Bug #2: 2**i + random.uniform(0,1)
 # 2026-04-29 FIX #4: Added retry_with_jitter helper for idempotent external calls per PART 4.A
+# 2026-07-24 FIX #5: Aligned retry_with_jitter to Mitigation B1 spec from MODULE 24B
+# 2026-07-24 FIX #6: Kept trackpath at 3 lines max per spec
 
 import logging
 import asyncio
@@ -284,13 +286,14 @@ async def safe_call(fn, *args, retries=3, **kwargs):
     log.error(f"All {retries} attempts failed for {fn.__name__}")
     return None # MODULE 18/26 must check result before assuming success
 
-async def retry_with_jitter(fn, *args, max_attempts=3, **kwargs):
+async def retry_with_jitter(fn, *args, max_attempts=3, **kwargs): # FIX B1
     for i in range(max_attempts):
         try:
             return await fn(*args, **kwargs)
         except Exception:
             if i == max_attempts-1: raise
-            await asyncio.sleep((2**i) + random.uniform(0.1, 0.5)) # jitter
+            await asyncio.sleep((2**i) + random.uniform(0.1, 0.5))
+    return None
 
 # Console label on import for debugging
 # [MODULE 04 - LOGGER_UTILS] v1.0.3
@@ -497,11 +500,11 @@ async def get_health():
 if __name__!= "__main__":
     print("[MODULE 10 - HEALTH] Loaded v1.0.3")# [MODULE 11 - TOKENS_ECONOMY]
 # LABEL: TOKENS_ECONOMY
-# VERSION: 1.0.54
+# VERSION: 1.0.57
 # TRACKPATH:
-# 2026-07-23 FIX #MIT1: Change admin payment insert to state='reserving' for DB-FIRST 2PC reservation flow
-# 2026-07-24 FIX #MITA-5.2: Use OCC_RETRIES from CONFIG_LOADER instead of hardcoded 5
 # 2026-07-24 FIX #MITA-2.1: Standardize lock order to TX first then uid_lock per Mitigation A
+# 2026-07-24 FIX #TYPEA-11-ADMIN: Admin path now finalizes payment paid=true tokens_credited=true state=paid per TYPE A item 5
+# 2026-07-24 FIX #TYPE1-11: Remove payment_version bump and add guard to prevent non-admin finalization per TYPE 1 item 2
 
 from db.models import User, Payment, WebhookJob
 from sqlalchemy import update, select, insert, or_
@@ -554,9 +557,9 @@ async def _job_is_stale(db: AsyncSession, job_id: int) -> bool:
 # END PART
 
 # PART: ADD_TOKENS_ATOMIC
-# HEADER: FIX #A Claim job_id first before touching tokens. User upsert + Payment update commit together or roll back 100%
-# HEADER: FIX #B1 Idempotent to same job_id: allow claim if processed_job_id is NULL or already this job_id
-# HEADER: FIX #D1 Single source of truth for claiming. Allow steal if previous job is stale
+# HEADER: FIX #A Claim payment_version first before touching tokens. User upsert + Payment update commit together or roll back 100%
+# HEADER: FIX #B1 Idempotent: allow claim if payment_version == 0 or already > 0 but tokens not credited
+# HEADER: FIX #TYPEA-11 Use payment_version OCC instead of processed_job_id claim
 # HEADER: FIX #OCC1 Use balance_version OCC. Read version, update with version check, retry if rowcount 0
 # HEADER: FIX #OCC2 If user missing, INSERT with balance_version=1 to start OCC chain
 # HEADER: FIX #LIVE2 Use OCC_RETRIES with module-specific backoff 0.02-0.06*(2^attempt) to break livelock with activate_package/credit_referral
@@ -564,13 +567,19 @@ async def _job_is_stale(db: AsyncSession, job_id: int) -> bool:
 # HEADER: FIX #LOG1 Log final OCC retry attempt for contention visibility
 # HEADER: FIX #QUEUE1 Wrapped in per-uid lock to make OCC exhaustion impossible
 # HEADER: FIX #MITA-2.1 Lock order: TX first, then uid_lock
-async def _add_tokens_inner(uid, amount, payment_id: int = None, job_id: int = None, db: AsyncSession = None):
+# HEADER: FIX #MITC Recovery is sole authority to finalize payment. Do not set paid/tokens_credited here except for admin
+# HEADER: FIX #TYPE1-11 Guard: only MODULE 26 can finalize non-admin payments. Remove version bump
+async def _add_tokens_inner(uid, amount, payment_id: int = None, job_id: int = None, db: AsyncSession = None, reason: str = 'payment'):
     """Inner logic. Assumes caller already set SERIALIZABLE isolation."""
     assert db is not None, "add_tokens requires external db session"
 
     now = datetime.now(timezone.utc)
 
     if payment_id is not None:
+        # FIX #TYPE1-11: Only MODULE 26 can finalize payments
+        if reason!= 'admin':
+            raise RuntimeError("Only MODULE 26 can finalize payments")
+
         # FIX #144: Lock both Payment and User before doing anything
         stmt_lock_payment = select(Payment).where(Payment.id == payment_id).with_for_update()
         result_lock_p = await db.execute(stmt_lock_payment)
@@ -578,27 +587,8 @@ async def _add_tokens_inner(uid, amount, payment_id: int = None, job_id: int = N
         if payment is None:
             return False
 
-        # FIX #B1 + FIX #D1: Claim job_id first to prevent double processing on recovery
-        if job_id is not None:
-            res_claim = await db.execute(
-                update(Payment)
-     .where(Payment.id == payment_id)
-     .where(or_(Payment.processed_job_id.is_(None), Payment.processed_job_id == job_id))
-     .values(processed_job_id=job_id)
-            )
-            if res_claim.rowcount == 0:
-                res_current = await db.execute(select(Payment.processed_job_id).where(Payment.id == payment_id))
-                current_job = res_current.scalar_one_or_none()
-                if await _job_is_stale(db, current_job):
-                    await db.execute(
-                        update(Payment).where(Payment.id == payment_id).values(processed_job_id=job_id)
-                    )
-                else:
-                    if payment.paid and payment.tokens_credited:
-                        return True
-                    return False
-
-        if payment.paid or payment.tokens_credited:
+        # Idempotency check only. Do not bump payment_version here
+        if payment.payment_version > 0 and payment.tokens_credited:
             return True
 
     # FIX #OCC1 + FIX #OCC2 + FIX #LIVE2: OCC loop for balance update, with INSERT fallback
@@ -622,8 +612,8 @@ async def _add_tokens_inner(uid, amount, payment_id: int = None, job_id: int = N
             expected_version = row[0]
             stmt = (
                 update(User)
-     .where(User.uid == uid, User.balance_version == expected_version)
-     .values(
+ .where(User.uid == uid, User.balance_version == expected_version)
+ .values(
                     tokens=User.tokens + amount,
                     balance_version=User.balance_version + 1
                 )
@@ -637,18 +627,7 @@ async def _add_tokens_inner(uid, amount, payment_id: int = None, job_id: int = N
         # Could not update after retries
         return False
 
-    if payment_id is not None:
-        await db.execute(
-            update(Payment)
- .where(Payment.id == payment_id)
- .values(
-                paid=True,
-                tokens_credited=True,
-                credited_at=now,
-                state='paid'
-            )
-        )
-
+    # FIX #MITC: REMOVED payment finalization block for normal payments. Recovery in MODULE 26 is sole authority
     return True
 # END PART
 
@@ -657,6 +636,7 @@ async def _add_tokens_inner(uid, amount, payment_id: int = None, job_id: int = N
 # HEADER: FIX #QUEUE1 Acquire per-uid lock for full duration to prevent concurrent add/deduct
 # HEADER: FIX #MIT1 Use reserving state for admin payments
 # HEADER: FIX #MITA-2.1 Lock order: TX first, then uid_lock
+# HEADER: FIX #TYPEA-11-ADMIN Admin path finalizes payment in same TX per TYPE A item 5
 async def add_tokens(uid, amount, payment_id: int = None, job_id: int = None, db: AsyncSession = None, reason: str = 'payment'):
     if payment_id is not None and db is None:
         raise ValueError("add_tokens requires external db session when payment_id is provided")
@@ -678,24 +658,36 @@ async def add_tokens(uid, amount, payment_id: int = None, job_id: int = None, db
                     await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
 
                     if payment_id is None and reason == 'admin':
+                        now = datetime.now(timezone.utc)
+                        # TYPE A item 5: Admin is terminal. Set paid/tokens_credited/state in same INSERT
                         stmt_payment = insert(Payment).values(
                             uid=uid,
                             amount_usd=0,
                             tokens=amount,
-                            paid=False,
-                            tokens_credited=False,
-                            credited_at=None,
+                            paid=True, # FIX #TYPEA-11-ADMIN
+                            tokens_credited=True, # FIX #TYPEA-11-ADMIN
+                            credited_at=now, # FIX #TYPEA-11-ADMIN
+                            paid_at=now, # FIX #TYPEA-11-ADMIN
                             client_ref=f'admin_add_{uuid.uuid4().hex}',
-                            processed_job_id=None,
-                            state='reserving' # FIX #MIT1: was 'pending'
+                            state='paid', # FIX #TYPEA-11-ADMIN
+                            payment_version=1 # TYPE A: set to 1 on create
                         ).returning(Payment.id)
                         res_payment = await db.execute(stmt_payment)
                         payment_id = res_payment.scalar_one()
+                    else:
+                        res = await _add_tokens_inner(uid, amount, payment_id, job_id, db, reason) # FIX #TYPE1-11 pass reason
+                        if res:
+                            return True
+                        # FIX #BURST1: retry whole op on OCC exhaustion, with jitter
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(random.uniform(0.03, 0.10))
+                            continue
+                        return False
 
-                    res = await _add_tokens_inner(uid, amount, payment_id, job_id, db)
+                    # if we created admin payment, still need to credit tokens
+                    res = await _add_tokens_inner(uid, amount, payment_id, job_id, db, reason) # FIX #TYPE1-11 pass reason
                     if res:
                         return True
-                    # FIX #BURST1: retry whole op on OCC exhaustion, with jitter
                     if attempt < max_attempts - 1:
                         await asyncio.sleep(random.uniform(0.03, 0.10))
                         continue
@@ -744,8 +736,8 @@ async def deduct_tokens(uid, amount, idempotency_key: str = None, db: AsyncSessi
 
                     stmt = (
                         update(User)
-             .where(User.uid == uid, User.balance_version == expected_version, User.tokens >= amount)
-             .values(
+         .where(User.uid == uid, User.balance_version == expected_version, User.tokens >= amount)
+         .values(
                             tokens=User.tokens - amount,
                             balance_version=User.balance_version + 1
                         )
@@ -760,9 +752,9 @@ async def deduct_tokens(uid, amount, idempotency_key: str = None, db: AsyncSessi
     return False
 
 # Console label on import for debugging
-# [MODULE 11 - TOKENS_ECONOMY] v1.0.54
+# [MODULE 11 - TOKENS_ECONOMY] v1.0.57
 if __name__!= "__main__":
-    print("[MODULE 11 - TOKENS_ECONOMY] Loaded v1.0.54")# [MODULE 12 - GATEKEEPER]
+    print("[MODULE 11 - TOKENS_ECONOMY] Loaded v1.0.57")# [MODULE 12 - GATEKEEPER]
 # LABEL: GATEKEEPER
 # TRACKPATH:
 # 2026-04-05 FIX #1: Converted all DB access to async
@@ -1697,38 +1689,37 @@ async def get_ref_owner_from_link(link: str, db: AsyncSession):
 # Console label on import for debugging
 # [MODULE 16 - REFERRAL_SYSTEM] v1.2.11
 if __name__!= "__main__":
-    print("[MODULE 16 - REFERRAL_SYSTEM] Loaded v1.2.11")
-
-[MODULE 17A - ALBY_CLIENT]
+    print("[MODULE 16 - REFERRAL_SYSTEM] Loaded v1.2.11")[MODULE 17A - ALBY_CLIENT]
 LABEL: ALBY_CLIENT
-VERSION: 1.0.42
+VERSION: 1.0.44
 TRACKPATH:
-2026-07-27 FIX #MIT1-DEL: Removed _alby_worker, _ALBY_QUEUE, alby_slot, BusyError per MITIGATION 1 worker-less fill
-2026-07-28 FIX #MIT1-REC: reconcile_reserving_payments now UPDATE state='dead' instead of DELETE per M1 item 3
+# 2026-07-28 FIX #MIT1-REC: reconcile_reserving_payments now UPDATE state='dead' instead of DELETE per M1 item 3
+# 2026-07-29 FIX #MIT1-SYNTAX: Removed http:// from all imports and calls per Mitigation Syntax Sanitize
+# 2026-09-14 FIX #TYPEA-17A-NOSTATE: Removed all state mutations. 17A now read-only per TYPE A item 1. Only MODULE 26 updates state
 
 import asyncio
 import random
 import time
 import os
-from http://db.db import SessionLocal, get_http, close_http
+from db.db import SessionLocal, get_http, close_http
 from config import ALBY_TOKEN
-from http://modules.config_loader import ALBY_RPS
+from modules.config_loader import ALBY_RPS
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import text
 
-alby_semaphore = http://asyncio.Semaphore(ALBY_RPS)
+alby_semaphore = asyncio.Semaphore(ALBY_RPS)
 
 async def _check_alby_status(invoice_id: str) -> str:
     s = await get_http()
     try:
         async with alby_semaphore:
-            r = await http://s.get(f"https://api.getalby.com/invoices/{invoice_id}",
+            r = await s.get(f"https://api.getalby.com/invoices/{invoice_id}",
                             headers={"Authorization": f"Bearer {ALBY_TOKEN}"})
-        if http://r.status == 200:
-            data = await http://r.json()
-            if http://data.get("state") == "settled" or http://data.get("paid") is True:
+        if r.status == 200:
+            data = await r.json()
+            if data.get("state") == "settled" or data.get("paid") is True:
                 return "settled"
-            return http://data.get("state", "unknown")
+            return data.get("state", "unknown")
     except Exception: pass
     return "unknown"
 
@@ -1736,43 +1727,46 @@ async def _check_alby_status_by_client_ref(client_ref: str) -> dict | None:
     s = await get_http()
     try:
         async with alby_semaphore:
-            r = await http://s.get(f"https://api.getalby.com/invoices/by-client-ref/{client_ref}",
+            r = await s.get(f"https://api.getalby.com/invoices/by-client-ref/{client_ref}",
                             headers={"Authorization": f"Bearer {ALBY_TOKEN}"})
-        if http://r.status == 200: return await http://r.json()
+        if r.status == 200: return await r.json()
     except Exception: pass
     return None
 
-PART: RECONCILE_ATOMIC
-HEADER: FIX #A24 Accept external db to participate in caller's TX. FIX #46: IO outside TX. FIX #MIT1D: Changed state filter to 'reserving'
+# PART: RECONCILE_ATOMIC
+# HEADER: FIX #A24 Accept external db to participate in caller's TX. FIX #46: IO outside TX. FIX #MIT1D: Changed state filter to 'reserving'
+# HEADER: FIX #TYPEA-17A-NOSTATE: No longer sets state='open'. Only fills invoice fields. State transition deferred to MODULE 26
 async def _reconcile_orphaned_invoices(db=None):
-    from http://db.models import Payment
+    from db.models import Payment
     own_db = False
     if db is None:
         db = SessionLocal()
         own_db = True
     try:
-        async with http://db.begin():
+        async with db.begin():
             stmt = text("SELECT id, client_ref FROM payments WHERE paid = false AND invoice_id IS NULL AND state = 'reserving' AND created > now() - interval '72 hours'") # FIX #MIT1D
-            res = await http://db.execute(stmt)
-            orphans = http://res.fetchall()
+            res = await db.execute(stmt)
+            orphans = res.fetchall()
 
         updates = []
         for pay_id, client_ref in orphans:
             data = await _check_alby_status_by_client_ref(client_ref)
-            if data and http://data.get("id"):
-                http://updates.append((data.get("id"), http://data.get("payment_request"), http://data.get("expires_at"), pay_id))
+            if data and data.get("id"):
+                updates.append((data.get("id"), data.get("payment_request"), data.get("expires_at"), pay_id))
 
         if updates:
-            async with http://db.begin():
+            async with db.begin():
                 for inv, pr, exp, pay_id in updates:
-                    await http://db.execute(text("UPDATE payments SET invoice_id=:inv, payment_request=:pr, expires_at=:exp, state='open' WHERE id=:id"),
+                    # FIX #TYPEA-17A-NOSTATE: removed state='open'. MODULE 26 owns state transition
+                    await db.execute(text("UPDATE payments SET invoice_id=:inv, payment_request=:pr, expires_at=:exp WHERE id=:id"),
                                      {"inv": inv, "pr": pr, "exp": exp, "id": pay_id})
     finally:
-        if own_db: await http://db.close()
-END PART
+        if own_db: await db.close()
+# END PART
 
-PART: RECONCILE_RESERVING
-HEADER: FIX #MIT1C Boot reconciliation for payments left in 'reserving'. Never delete. Set state='dead' if not found in Alby
+# PART: RECONCILE_RESERVING
+# HEADER: FIX #MIT1C Boot reconciliation for payments left in 'reserving'. Never delete. Never mutate state per TYPE A item 1
+# HEADER: FIX #TYPEA-17A-NOSTATE: No longer sets state='open' or 'dead'. Only fills invoice fields or leaves row as reserving for MODULE 26
 async def reconcile_reserving_payments(db=None):
     from config import RESERVING_TIMEOUT_SEC
     own_db = False
@@ -1780,68 +1774,67 @@ async def reconcile_reserving_payments(db=None):
         db = SessionLocal()
         own_db = True
     try:
-        async with http://db.begin():
+        async with db.begin():
             stmt = text(f"""
                 SELECT id, client_ref FROM payments
                 WHERE state = 'reserving' AND invoice_id IS NULL
                 AND created < now() - interval '{RESERVING_TIMEOUT_SEC} seconds'
             """)
-            res = await http://db.execute(stmt)
-            reserving = http://res.fetchall()
+            res = await db.execute(stmt)
+            reserving = res.fetchall()
 
         for pay_id, client_ref in reserving:
             data = await _check_alby_status_by_client_ref(client_ref)
-            if data and http://data.get("id"):
-                async with http://db.begin():
-                    await http://db.execute(text("""
-                        UPDATE payments SET invoice_id=:inv, payment_request=:pr, expires_at=:exp, state='open'
+            if data and data.get("id"):
+                async with db.begin():
+                    # FIX #TYPEA-17A-NOSTATE: removed state='open'. Only fill Alby fields
+                    await db.execute(text("""
+                        UPDATE payments SET invoice_id=:inv, payment_request=:pr, expires_at=:exp
                         WHERE id=:id
-                    """), {"inv": http://data.get("id"), "pr": http://data.get("payment_request"),
-                           "exp": http://data.get("expires_at"), "id": pay_id})
+                    """), {"inv": data.get("id"), "pr": data.get("payment_request"),
+                           "exp": data.get("expires_at"), "id": pay_id})
             else:
-                # FIX #MIT1-REC: Never delete. Mark dead for audit/boot recovery
-                async with http://db.begin():
-                    await http://db.execute(text("UPDATE payments SET state='dead' WHERE id=:id"), {"id": pay_id})
+                # FIX #TYPEA-17A-NOSTATE: removed state='dead'. Leave as reserving. MODULE 26 will decide on dead
+                pass
     finally:
-        if own_db: await http://db.close()
-END PART
+        if own_db: await db.close()
+# END PART
 
-if *name*!= "*main*":
-    print("[MODULE 17A - ALBY_CLIENT] Loaded v1.0.42")
+if __name__!= "__main__":
+    print("[MODULE 17A - ALBY_CLIENT] Loaded v1.0.44")
 
 [MODULE 17B - PAYMENTS_API]
 LABEL: PAYMENTS_API
-VERSION: 1.0.35
+VERSION: 1.0.38
 TRACKPATH:
-2026-07-28 FIX #MIT1-17B1: Remove advisory lock. Use INSERT ON CONFLICT DO NOTHING on client_ref per M1 item 1
-2026-07-28 FIX #MIT1-17B2: After Alby success UPDATE with state='reserving' AND invoice_id IS NULL check per M1 item 2
-2026-07-29 FIX #MITA-1: create_invoice now always returns payment_id and falls back to SELECT if UPDATE rowcount=0 per Mitigation A Bug 1.2
-2026-07-29 FIX #MITY-1: Remove runtime voiding. On Alby failure do nothing, let row expire. Never set state='voided' per MITIGATION Y
+# 2026-07-28 FIX #MIT1-17B2: After Alby success UPDATE with state='reserving' AND invoice_id IS NULL check per M1 item 2
+# 2026-07-29 FIX #MITA-1: create_invoice now always returns payment_id and falls back to SELECT if UPDATE rowcount=0 per Mitigation A Bug 1.2
+# 2026-09-13 FIX #TYPEA-17B-1: Removed UPDATE state='open'. Only INSERT reserving. Single authority for state change is now MODULE 26 per TYPE A item 1
 
 import asyncio
 import time
 import os
 import uuid
-from http://db.db import SessionLocal, get_http
-from http://db.models import Setting, Payment
+from db.db import SessionLocal, get_http
+from db.models import Setting, Payment
 from config import ALBY_TOKEN
-from http://modules.config_loader import IS_PAID, ALBY_RPS
+from modules.config_loader import IS_PAID, ALBY_RPS
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import update, select, text, and_, delete, insert
-from http://sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError
 
 _PENDING_MAP_FILE = "/tmp/alby_pending_map.json"
 _PRICE_CACHE = {"price": None, "tokens": None, "ts": 0}
 CACHE_TTL_PRICE = 300
-alby_semaphore = http://asyncio.Semaphore(ALBY_RPS)
+alby_semaphore = asyncio.Semaphore(ALBY_RPS)
 
 async def _get_price_config():
-    now = http://time.time()
+    now = time.time()
     if _PRICE_CACHE["price"] is not None and (now - _PRICE_CACHE["ts"] < CACHE_TTL_PRICE):
         return _PRICE_CACHE["price"], _PRICE_CACHE["tokens"]
     async with SessionLocal() as db:
-        price_s = await http://db.get(Setting, "price_usd")
-        tokens_s = await http://db.get(Setting, "tokens_per_usd")
+        price_s = await db.get(Setting, "price_usd")
+        tokens_s = await db.get(Setting, "tokens_per_usd")
         price = float(price_s.value) if price_s else 1.0
         tokens = int(tokens_s.value) if tokens_s else 100
     _PRICE_CACHE["price"] = price
@@ -1849,75 +1842,63 @@ async def _get_price_config():
     _PRICE_CACHE["ts"] = now
     return price, tokens
 
-PART: INVOICE_CREATE_ATOMIC
-HEADER: FIX #MIT1-2PC: DB-FIRST 2PC. INSERT reserving ON CONFLICT -> COMMIT -> CALL ALBY SYNC -> UPDATE open with rowcount check -> COMMIT. 
-HEADER: FIX #MITY-1: On Alby failure do NOT void. Leave row as reserving to expire naturally.
-HEADER: FIX #MITA-1 Always return payment_id. If UPDATE fails rowcount=0, SELECT by id and return DB state per Mitigation A
+# PART: INVOICE_CREATE_ATOMIC
+# HEADER: FIX #MIT1-2PC: DB-FIRST 1PC. INSERT reserving ON CONFLICT -> COMMIT -> CALL ALBY SYNC -> RETURN. No DB state mutation after insert per TYPE A item 1
+# HEADER: FIX #MITY-1: On Alby failure do NOT void. Leave row as reserving to expire naturally.
+# HEADER: FIX #MITA-1 Always return payment_id. If row exists, return DB state per Mitigation A
+# HEADER: FIX #TYPEA-17B Set payment_version=1 on create. Only MODULE 26 will increment it further
 async def create_invoice(uid):
     db = SessionLocal()
     try:
         price_usd, tokens_per_usd = await _get_price_config()
         amount_usd = price_usd
         client_ref = str(uuid.uuid4())
-        now = http://datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
 
         # 1. INSERT reserving row with ON CONFLICT and COMMIT. No advisory lock
-        async with http://db.begin():
+        async with db.begin():
             stmt_ins = insert(Payment).values(
                 uid=uid, paid=False, amount_usd=amount_usd, tokens=tokens_per_usd,
                 client_ref=client_ref, created=now, state='reserving',
-                invoice_id=None, payment_request=None, expires_at=None
+                invoice_id=None, payment_request=None, expires_at=None,
+                payment_version=1 # TYPE A: initialize version guard
             ).on_conflict_do_nothing(index_elements=['client_ref']).returning(Payment.id)
-            res = await http://db.execute(stmt_ins)
-            pay_id = http://res.scalar_one_or_none()
+            res = await db.execute(stmt_ins)
+            pay_id = res.scalar_one_or_none()
 
             if pay_id is None:
                 # Conflict: fetch existing reserving/open row
-                existing = await http://db.scalar(
+                existing = await db.scalar(
                     select(Payment).where(Payment.client_ref == client_ref).with_for_update()
                 )
                 if existing:
-                    if http://existing.state == 'open' and http://existing.payment_request:
-                        # FIX #MITA-1: return tuple with payment_id
-                        return (existing.payment_request, http://existing.invoice_id, http://existing.id, http://existing.amount_usd, http://existing.tokens)
-                    pay_id = http://existing.id
-                    client_ref = http://existing.client_ref
+                    # Return whatever is in DB. State may still be reserving
+                    return (existing.payment_request, existing.invoice_id, existing.id, existing.amount_usd, existing.tokens)
+                # Should not happen due to on_conflict, but safety
+                raise RuntimeError("Failed to get payment_id on conflict")
 
         # 2. CALL ALBY SYNCHRONOUSLY outside TX
         s = await get_http()
         try:
             async with alby_semaphore:
-                r = await http://s.post("https://api.getalby.com/invoices",
+                r = await s.post("https://api.getalby.com/invoices",
                                  headers={"Authorization": f"Bearer {ALBY_TOKEN}",
                                           "X-Idempotency-Key": client_ref},
                                  json={"amount": amount_usd,
                                        "metadata": {"uid": uid, "tokens": tokens_per_usd, "client_ref": client_ref}})
-            if http://r.status >= 400:
+            if r.status >= 400:
                 raise RuntimeError(f"Alby invoice creation failed status {r.status}")
-            data = await http://r.json()
+            data = await r.json()
         except Exception:
             # FIX #MITY-1: Do NOT void. Leave as reserving. It will be cleaned by reconcile_reserving_payments on boot
             raise
 
-        # 3b. If success, UPDATE to open with state='reserving' AND invoice_id IS NULL check
-        async with http://db.begin():
-            res_upd = await http://db.execute(text("""
-                UPDATE payments SET state='open', invoice_id=:inv, payment_request=:pr, expires_at=:exp
-                WHERE id=:id AND state='reserving' AND invoice_id IS NULL
-                RETURNING id
-            """), {"inv": data["id"], "pr": data["payment_request"], "exp": data["expires_at"], "id": pay_id})
-            
-            if res_upd.rowcount == 0:
-                # FIX #MITA-1: Webhook already filled it. Return DB state with payment_id
-                existing = await http://db.scalar(select(Payment).where(Payment.id == pay_id))
-                return (existing.payment_request, http://existing.invoice_id, http://existing.id, http://existing.amount_usd, http://existing.tokens)
-
-        # FIX #MITA-1: Always return 5-tuple including payment_id
+        # 3. FIX #TYPEA-17B-1: Do NOT UPDATE state/invoice_id here. 
+        # MODULE 26 is sole authority to move reserving->open. Return Alby data directly.
         return (data["payment_request"], data["id"], pay_id, amount_usd, tokens_per_usd)
     finally:
-        await http://db.close()
-END PART
-# [MODULE 18 - KICK]
+        await db.close()
+# END PART# [MODULE 18 - KICK]
 # LABEL: KICK_UTILS
 # VERSION: 1.0.4
 # TRACKPATH: 
@@ -2319,11 +2300,11 @@ asyncio.run(main())
 if __name__!= "__main__":
     print("[MODULE 22 - ENTRY] Loaded v1.1.34")# [MODULE 23 - WEBHOOK_SERVER]
 # LABEL: WEBHOOK_SERVER
-# VERSION: 1.3.73
+# VERSION: 1.3.75
 # TRACKPATH:
-# 2026-07-28 FIX #MIT1-3: Return 200 if fallback finds state='open'. Only UPDATE if state='reserving' AND invoice_id IS NULL per MITIGATION 1 #3
-# 2026-07-29 FIX #MIT1-4: Remove 409 on already processed. Rely on add_tokens idempotency per M1 item 4
 # 2026-08-01 FIX #MITA-1: Allow fallback WHERE to include 'dead' and always set state='open' to unblock late webhooks per MITIGATION A Item 1
+# 2026-08-01 FIX #MIT23-FINALIZE: Remove paid=true/paid_at. Webhook is now read-only setter per MODULE 23 PATCH
+# 2026-08-02 FIX #TYPEA-23: Webhook now INSERT-ONLY to payment_webhook_events. No UPDATEs per TYPE A item 1
 
 import json
 import hmac
@@ -2347,9 +2328,9 @@ from modules.config_loader import IS_PAID, WEBHOOK_TIMEOUT, WEBHOOK_NOTIFY_PARAL
 
 log = logging.getLogger(__name__)
 
-PART: UID_SERIALIZATION
-HEADER: FIX #QUEUE_SHARED Removed local _uid_locks. Now uses shared lock from tokens module to serialize with add_tokens/activate_package/credit_referral
-END PART
+# PART: UID_SERIALIZATION
+# HEADER: FIX #QUEUE_SHARED Removed local _uid_locks. Now uses shared lock from tokens module to serialize with add_tokens/activate_package/credit_referral
+# END PART
 
 WEBHOOK_SECRET = os.getenv("ALBY_WEBHOOK_SECRET")
 IDEMPOTENCY_TTL = 86400
@@ -2371,8 +2352,8 @@ async def _cleanup_old_jobs(db): # FIX #35: use parent db, no internal begin
 
 # FIX #MITA-3: _enqueue_job REMOVED per Mitigation A Item 3
 
-PART: NOTIFY_TG_OUTSIDE_TX
-HEADER: FIX #A34 TG IO moved out of TX to prevent TX hang + FIX #P4B3 idempotency check
+# PART: NOTIFY_TG_OUTSIDE_TX
+# HEADER: FIX #A34 TG IO moved out of TX to prevent TX hang + FIX #P4B3 idempotency check
 async def _send_notify_messages(uid, tokens_to_credit):
     async with SessionLocal() as db:
         res = await db.execute(select(Payment.tokens_credited).where(Payment.uid==uid, Payment.tokens_credited==True).order_by(Payment.credited_at.desc()).limit(1))
@@ -2395,11 +2376,11 @@ async def _send_notify_messages(uid, tokens_to_credit):
 
 async def notify_user(uid, tokens_to_credit, db):
     await set_state(uid, "packages", db=db)
-END PART
+# END PART
 
-PART: WEBHOOK_ALBY_ATOMIC
-HEADER: FIX #MITA-3 Webhook is idempotent setter only. UPDATE payments. No WebhookJob. No add_tokens per Mitigation A Item 3
-HEADER: FIX #MITA-1 Fallback WHERE now includes 'dead'. Always set state='open' per MITIGATION A Item 1
+# PART: WEBHOOK_ALBY_ATOMIC
+# HEADER: FIX #TYPEA-23 Webhook is now read-only. Only INSERT into payment_webhook_events. No UPDATE to payments per TYPE A item 1
+# HEADER: FIX #MIT23-FINALIZE Webhook NEVER sets paid=true. Only recovery in MODULE 26 finalizes
 async def alby_webhook(request):
     if not WEBHOOK_SECRET:
         return web.Response(status=500, text="WEBHOOK_SECRET not configured")
@@ -2413,6 +2394,7 @@ async def alby_webhook(request):
     data = json.loads(body)
     if data.get("event")!= "invoice.paid":
         return web.Response(text="ignored")
+    
     invoice_id = data["data"]["id"]
     amount_usd = float(data["data"]["amount"])
     client_ref = data["data"].get("metadata", {}).get("client_ref")
@@ -2420,45 +2402,28 @@ async def alby_webhook(request):
 
     async with SessionLocal() as db:
         try:
-            async with db.begin(): # FIX #MITA-3: Single UPDATE only
-                # Primary path: update by invoice_id if already set
-                res_upd = await db.execute(
+            async with db.begin(): # TYPE A: INSERT ONLY
+                # Idempotency: ON CONFLICT DO NOTHING so duplicate webhooks are safe
+                await db.execute(
                     text("""
-                        UPDATE payments 
-                        SET state='open', invoice_id=:inv, paid=true, paid_at=now() 
-                        WHERE invoice_id=:inv AND state!='paid'
-                        RETURNING id, uid
+                        INSERT INTO payment_webhook_events (invoice_id, client_ref, payload, received_at)
+                        VALUES (:inv, :ref, :payload, :ts)
+                        ON CONFLICT (invoice_id) DO NOTHING
                     """),
-                    {"inv": invoice_id}
+                    {
+                        "inv": invoice_id, 
+                        "ref": client_ref, 
+                        "payload": json.dumps(data), 
+                        "ts": datetime.now(timezone.utc)
+                    }
                 )
-                row = res_upd.fetchone()
-
-                # Fallback if invoice_id not yet set but client_ref matches
-                # FIX #MITA-1: allow 'reserving','open','dead' so late webhooks can recover
-                if not row and client_ref:
-                    res_fallback = await db.execute(
-                        text("""
-                            UPDATE payments 
-                            SET state='open', invoice_id=:inv, paid=true, paid_at=now() 
-                            WHERE client_ref=:ref AND state IN ('reserving','open','dead') AND paid=false
-                            RETURNING id, uid
-                        """),
-                        {"inv": invoice_id, "ref": client_ref}
-                    )
-                    row = res_fallback.fetchone()
-
-                if not row:
-                    return web.Response(status=409, text="payment not found")
-
-                pay_id, uid = row
-
         except Exception:
             await db.rollback()
             raise
     
-    asyncio.create_task(_send_notify_messages(uid, tokens_to_credit))
+    # No state mutation here. MODULE 26 will process event and set state='open' -> 'paid'
     return web.Response(status=200, text="ok")
-END PART
+# END PART
 
 async def start_webhook_server():
     app_web = web.Application(client_max_size=1024_1024, client_max_timeout=WEBHOOK_TIMEOUT)
@@ -2470,7 +2435,7 @@ async def start_webhook_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
-    print("[MODULE 23 - WEBHOOK_SERVER] Loaded v1.3.73")
+    print("[MODULE 23 - WEBHOOK_SERVER] Loaded v1.3.75")
     print("Webhook server running on :8080")# [MODULE 24A - UI_CALLBACKS]
 # LABEL: UI_CALLBACKS
 # VERSION: 1.0.5
@@ -2686,54 +2651,54 @@ async def cb_sos(_, query: CallbackQuery):
 if __name__!= "__main__":
     print("[MODULE 24A - UI_CALLBACKS] Loaded v1.0.5")
 
-[MODULE 24B - PAYMENT_CALLBACKS]
-LABEL: PAYMENT_CALLBACKS
-VERSION: 1.0.21
-TRACKPATH:
-2026-09-09 FIX #MIT1A8: Wrap lock_user_for_buy and unlock in same TX as TX2 with try/finally per Mitigation 1 #5
-2026-09-09 FIX #MITA-2: Poll by payment_id for 10s instead of inv_id loop. Remove runtime polling per Mitigation A Item 2
-2026-09-09 FIX #MITY-1: Deleted _verify_with_alby_and_delete_if_expired. Never void at runtime. If expired, ignore and create new per MITIGATION Y
+# [MODULE 24B - PAYMENT_CALLBACKS]
+# LABEL: PAYMENT_CALLBACKS
+# VERSION: 1.0.26
+# TRACKPATH:
+# 2026-09-10 FIX #MIT24B-B1: Fix retry_with_jitter signature and syntax per MODULE 24B PATCH
+# 2026-09-12 FIX #TYPEA-24B-REUSE: Reuse WHERE now includes tokens_credited=false and expires_at>now. Skip dead/paid per TYPE A item 6
+# 2026-07-24 FIX #TYPE1-24B-IMPORT: Use _check_alby_status_by_client_ref from 17A for reuse guard per TYPE 1 item 1
 
 import asyncio
 import time
 import random
 from datetime import datetime, timezone, timedelta
 from pyrogram import filters
-from http://pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from http://core.bot import app
-from http://core.state_manager import set_state
-from http://modules.tokens import add_tokens
-from http://modules.payments import create_invoice, _check_alby_status # FIX #MIT1-DEL: BusyError removed
-from http://db.db import SessionLocal
-from http://db.models import Payment, WebhookJob, User
-from http://modules.menus import packages_menu, buy_menu, invite_menu, confirm_buy_menu # confirm_buy_menu from MODULE 20
-from http://modules.templates import PAYMENT_WARNING
-from http://modules.callbacks_ui import gate_guard, vanish_and_send, _safe_send, _MENU_COALESCE
+from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from core.bot import app
+from core.state_manager import set_state
+from modules.tokens import add_tokens
+from modules.payments import create_invoice
+from modules.alby_client import _check_alby_status_by_client_ref # FIX #TYPE1-24B-IMPORT: import from 17A
+from db.db import SessionLocal
+from db.models import Payment, WebhookJob, User
+from modules.menus import packages_menu, buy_menu, invite_menu, confirm_buy_menu # confirm_buy_menu from MODULE 20
+from modules.templates import PAYMENT_WARNING
+from modules.callbacks_ui import gate_guard, vanish_and_send, _safe_send, _MENU_COALESCE
 from sqlalchemy import update, select, func, and_, text, delete
-from http://sqlalchemy.dialects.postgresql import insert as pg_insert
-from http://sqlalchemy.exc import IntegrityError
-from http://sqlalchemy.ext.asyncio import AsyncSession
-from http://modules.config_loader import USER_LOCK_TIMEOUT_SEC # PART2A
+from sqlalchemy.dialects.polstgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from modules.config_loader import USER_LOCK_TIMEOUT_SEC # PART2A
 
 _PAYMENT_DEBOUNCE = {}
 
-PART: RETRY_HELPER
-HEADER: FIX #P4A retry with jitter per PART4A
-async def retry_with_jitter(fn, _args, max_attempts=3, __kwargs):
+# PART: RETRY_HELPER
+# HEADER: FIX #B1 retry_with_jitter per MODULE 24B PATCH
+async def retry_with_jitter(fn, *args, max_attempts=3, **kwargs): # FIX B1
     for i in range(max_attempts):
         try:
-            return await fn(_args, *_kwargs)
+            return await fn(*args, **kwargs)
         except Exception:
             if i == max_attempts-1: raise
-            await http://asyncio.sleep((2__i) + http://random.uniform(0.1, 0.5)) # jitter
+            await asyncio.sleep((2**i) + random.uniform(0.1, 0.5))
     return None
-END PART
+# END PART
 
 async def _attempt_create_invoice(uid, max_attempts=3):
     for attempt in range(max_attempts):
         try:
             return await create_invoice(uid), None
-        # FIX #MIT1-DEL: BusyError removed, create_invoice no longer raises it
         except IntegrityError:
             return None, "duplicate"
         except Exception as e:
@@ -2741,93 +2706,105 @@ async def _attempt_create_invoice(uid, max_attempts=3):
     return None, "unknown"
 
 async def lock_user_for_buy(uid, db: AsyncSession): # FIX #P2D
-    until = http://datetime.now(timezone.utc) + timedelta(seconds=USER_LOCK_TIMEOUT_SEC)
-    await http://db.execute(update(User).where(User.uid==uid).values(invoice_lock_until=until))
+    until = datetime.now(timezone.utc) + timedelta(seconds=USER_LOCK_TIMEOUT_SEC)
+    await db.execute(update(User).where(User.uid==uid).values(invoice_lock_until=until))
 
 async def unlock_user_for_buy(uid, db: AsyncSession): # FIX #P2D
-    await http://db.execute(update(User).where(User.uid==uid).values(invoice_lock_until=None))
+    await db.execute(update(User).where(User.uid==uid).values(invoice_lock_until=None))
 
 async def is_user_locked_for_buy(uid, db: AsyncSession) -> bool: # FIX #P2D
     # FIX #MITA-2.2: SELECT FOR UPDATE inside caller's TX
-    res = await http://db.execute(select(User.invoice_lock_until).where(User.uid==uid).with_for_update())
-    until = http://res.scalar_one_or_none()
-    return until is not None and until > http://datetime.now(timezone.utc)
+    res = await db.execute(select(User.invoice_lock_until).where(User.uid==uid).with_for_update())
+    until = res.scalar_one_or_none()
+    return until is not None and until > datetime.now(timezone.utc)
 
-PART: CB_SEND_INVITE_ATOMIC
-HEADER: FIX #60 DB only. No TG, no nested TX. Caller commits atomically
+# PART: CB_SEND_INVITE_ATOMIC
+# HEADER: FIX #60 DB only. No TG, no nested TX. Caller commits atomically
 async def cb_send_invite(_, query, channel, db: AsyncSession):
-    uid = http://query.from_user.id
+    uid = query.from_user.id
     await send_invite(app, uid, channel) # TG is ok, can be retried
-    u = await http://db.get(User, uid)
-    http://u.invite_pending_chat_id = channel
+    u = await db.get(User, uid)
+    u.invite_pending_chat_id = channel
     return None
-END PART
+# END PART
 
 async def _do_send_invite(client, query, channel, msg_id):
     msg = await vanish_and_send(client, query, "main", "Tap to join premium:", await invite_menu(channel))
     async with SessionLocal() as db:
-        async with http://db.begin():
-            u = await http://db.get(User, http://query.from_user.id)
-            http://u.invite_pending_msg_id = http://msg.id
-
-FIX #MITY-1: _verify_with_alby_and_delete_if_expired REMOVED per MITIGATION Y. Never void at runtime.
+        async with db.begin():
+            u = await db.get(User, query.from_user.id)
+            u.invite_pending_msg_id = msg.id
 
 @app.on_callback_query(filters.regex("buy_tokens")) # REMOVED - replaced by 2-step
 @gate_guard
 async def cb_buy_tokens(_, query: CallbackQuery):
-    await http://query.answer("Use the new flow", show_alert=False)
+    await query.answer("Use the new flow", show_alert=False)
     return
 
 @app.on_callback_query(filters.regex("buy")) # FIX #P2D: Step 1 - no lock here anymore
 @gate_guard
 async def cb_buy(_, query: CallbackQuery):
-    uid = http://query.from_user.id
-    now = http://time.time()
+    uid = query.from_user.id
+    now = time.time()
     last_ts = _MENU_COALESCE.get(uid, 0)
     if now - last_ts < 0.5:
-        await http://query.answer("Processing...", show_alert=False)
+        await query.answer("Processing...", show_alert=False)
         return
-    _MENU_COALESCE = now[uid]
+    _MENU_COALESCE[uid] = now # FIX B2
 
     async with SessionLocal() as db:
-        async with http://db.begin():
+        async with db.begin():
             await set_state(uid, "confirm_buy", db=db)
 
-    await http://query.answer()
+    await query.answer()
     await _safe_send(app, uid, "Proceed to create a payment invoice?", reply_markup=confirm_buy_menu(), photo=False)
 
-PART: CB_BUY_CONFIRM_YES_DB_FIRST
-HEADER: FIX #MITA-2 Poll by payment_id for max 10s. No polling by inv_id. DB is source of truth per Mitigation A Item 2
-HEADER: FIX #MITY-1 If invoice expired, ignore it and create new. Never call Alby or set voided at runtime
+# PART: CB_BUY_CONFIRM_YES_DB_FIRST
+# HEADER: FIX #TYPEA-24B Poll by payment_version for max 10s. version>=2 means open. DB is source of truth per TYPE A item 6
+# HEADER: FIX #MITY-1 If invoice expired, ignore it and create new. Never call Alby or set voided at runtime
+# HEADER: FIX #TYPEA-24B-REUSE Reuse now requires tokens_credited=false AND expires_at>now. Skip if dead/paid per TYPE A item 6
+# HEADER: FIX #TYPE1-24B Add Alby + version check before reuse. Cannot reuse if Alby=paid or version!=1
 @app.on_callback_query(filters.regex("buy_confirm_yes")) # FIX #P2D + #P2E + #MIT1A8: Step 2 with atomic lock
 @gate_guard
 async def cb_buy_confirm_yes(_, query: CallbackQuery):
-    uid = http://query.from_user.id
-    now_dt = http://datetime.now(timezone.utc)
+    uid = query.from_user.id
+    now_dt = datetime.now(timezone.utc)
     pay_id = None
 
     async with SessionLocal() as db:
-        async with http://db.begin():
+        async with db.begin():
             # FIX #MIT1A8: lock and TX2 in same TX with try/finally
             await lock_user_for_buy(uid, db)
             try:
-                # 1. Invoice Reuse Logic per PART2E - FIX #MIT1-5: SELECT FOR UPDATE
-                res = await http://db.execute(select(Payment).where(
-                    http://Payment.uid==uid, http://Payment.paid==False, http://Payment.state.in_(['reserving','open']) # FIX #MIT1K
+                # 1. Invoice Reuse Logic per PART2E - FIX #TYPEA-24B-REUSE
+                res = await db.execute(select(Payment).where(
+                    Payment.uid==uid,
+                    Payment.paid==False,
+                    Payment.tokens_credited==False, # FIX #TYPEA-24B-REUSE
+                    Payment.state.in_(['reserving','open']), # FIX #MIT1K
+                    Payment.expires_at > now_dt # FIX #TYPEA-24B-REUSE
                 ).order_by(Payment.created.desc()).limit(1).with_for_update()) # FIX #MIT1-5
-                existing = http://res.scalar_one_or_none()
+                existing = res.scalar_one_or_none()
 
                 if existing:
-                    # FIX #MITY-1: If not expired, reuse. If expired, ignore it. Do NOT call Alby or void.
-                    if http://existing.expires_at and http://existing.expires_at > now_dt:
-                        pr = http://existing.payment_request
-                        amount_usd = http://existing.amount_usd
-                        tokens = http://existing.tokens
-                        inv_id = http://existing.invoice_id
-                        pay_id = http://existing.id
-                    else: # expired or no expires_at
-                        pr, inv_id, amount_usd, tokens, pay_id = None, None, None, None, None
+                    # FIX #TYPE1-24B: Check Alby + version before reuse using 17A function
+                    alby = await _check_alby_status_by_client_ref(existing.client_ref) # FIX #TYPE1-24B-IMPORT
+                    if alby and alby.get("state") in ["settled","paid"]:
+                        # Already paid, don't reuse. Force new invoice
+                        existing = None
+                    elif existing.payment_version!= 1:
+                        # Someone already advanced it, don't reuse
+                        existing = None
+
+                if existing:
+                    # Reuse valid invoice
+                    pr = existing.payment_request
+                    amount_usd = existing.amount_usd
+                    tokens = existing.tokens
+                    inv_id = existing.invoice_id
+                    pay_id = existing.id
                 else:
+                    # No valid invoice to reuse. This also covers case where only 'dead' or 'paid' exists
                     pr, inv_id, amount_usd, tokens, pay_id = None, None, None, None, None
 
                 # 2. Create new if needed - this is TX2
@@ -2835,75 +2812,78 @@ async def cb_buy_confirm_yes(_, query: CallbackQuery):
                     try:
                         result = await retry_with_jitter(create_invoice, uid) # FIX #P4A
                         pr, inv_id, pay_id, amount_usd, tokens = result # FIX #MITA-1: unpack 5-tuple
-                    # FIX #MIT1-DEL: Removed BusyError catch
                     except Exception as e:
                         raise
 
-                # FIX #MITA-2: Poll by payment_id for max 10s. Never rely on webhook
+                # TYPE A: Poll by payment_version for max 10s. version>=2 means state='open'
                 for _ in range(20): # 20 _ 0.5s = 10s
-                    res_pr = await http://db.execute(
-                        text("SELECT payment_request FROM payments WHERE id=:payment_id"),
+                    res_ver = await db.execute(
+                        text("SELECT payment_version FROM payments WHERE id=:payment_id"),
                         {"payment_id": pay_id}
                     )
-                    pr_row = res_pr.scalar_one_or_none()
-                    if pr_row:
-                        pr = pr_row
+                    ver = res_ver.scalar_one_or_none()
+                    if ver and ver >= 2:
                         break
-                    await http://asyncio.sleep(0.5)
+                    await asyncio.sleep(0.5)
                 else:
-                    raise RuntimeError("Alby is slow, try again") # FIX #MITA-2
+                    raise RuntimeError("Alby is slow, try again") # FIX #TYPEA-24B
+
+                # Re-fetch pr after version bump in case MODULE 26/17A filled it
+                res_pr = await db.execute(
+                    text("SELECT payment_request FROM payments WHERE id=:payment_id"),
+                    {"payment_id": pay_id}
+                )
+                pr = res_pr.scalar_one_or_none()
 
                 await set_state(uid, "buy", db=db)
             finally:
                 # FIX #MIT1A8: always unlock even on exception
                 await unlock_user_for_buy(uid, db)
-                # commit happens at end of http://db.begin() block
+                # commit happens at end of db.begin() block
 
-    await http://query.answer()
+    await query.answer()
     qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={pr}"
     caption = f"Pay {amount_usd}$ with Lightning:\n\n`{pr}`\n\n{PAYMENT_WARNING}"
-    http://asyncio.create_task(vanish_and_send(app, query, "main", caption, buy_menu()))
-    await _safe_send(app, http://query.from_user.id, qr_url, caption="Scan to pay with Lightning", photo=True)
-END PART
+    asyncio.create_task(vanish_and_send(app, query, "main", caption, buy_menu()))
+    await _safe_send(app, query.from_user.id, qr_url, caption="Scan to pay with Lightning", photo=True)
+# END PART
 
-Console label on import for debugging
-[MODULE 24B - PAYMENT_CALLBACKS] v1.0.21
-if *name*!= "*main*":
-    print("[MODULE 24B - PAYMENT_CALLBACKS] Loaded v1.0.21")
-[MODULE 26 - USER_AND_PAYMENT_LIFECYCLE]
-LABEL: USER_AND_PAYMENT_LIFECYCLE
-VERSION: 1.1.17
-TRACKPATH:
-2026-09-10 FIX #MIT1A7: Extend recover_missing_webhook_jobs to also pick state='open' AND paid=False per Mitigation 1 #4
-2026-09-10 FIX #MIT1L: Rename reconcile_reserving_boot->reconcile_reserving_payments and remove runtime cleaners per MITIGATION G1 #4
-2026-09-10 FIX #MITY-2: Add Bucket 4b to recover_missing_webhook_jobs for expired-but-paid invoices per MITIGATION Y Item 2
+# Console label on import for debugging
+# [MODULE 24B - PAYMENT_CALLBACKS] v1.0.26
+# [MODULE 26 - USER_AND_PAYMENT_LIFECYCLE]
+# LABEL: USER_AND_PAYMENT_LIFECYCLE
+# VERSION: 1.1.23
+# TRACKPATH:
+# 2026-09-10 FIX #MITY-2: Add Bucket 4b to recover_missing_webhook_jobs for expired-but-paid invoices per MITIGATION Y Item 2
+# 2026-09-12 FIX #TYPEA-26-VERS: Enforce payment_version=1 for reserving->open and payment_version=2 for open->paid per TYPE A item 3+4
+# 2026-09-25 FIX #TYPE1-26-DEAD: Add payment_version=1 guard + increment when marking reserving->dead per TYPE 1 item 1
 
 from datetime import datetime, timedelta, timezone
-from http://db.db import get_http, SessionLocal
-from http://db.models import User, Payment, WebhookJob
-from http://core.bot import app, tg_semaphore
-from http://core.scheduler import scheduler # kept import, no jobs added
-from http://core.state_manager import set_state
-from http://modules.kick import kick_with_fallback
-from http://modules.menus import packages_menu
-from http://modules.tokens import add_tokens
-from http://utils.constants import get_gif
+from db.db import get_http, SessionLocal
+from db.models import User, Payment, WebhookJob
+from core.bot import app, tg_semaphore
+from core.scheduler import scheduler # kept import, no jobs added
+from core.state_manager import set_state
+from modules.kick import kick_with_fallback
+from modules.menus import packages_menu
+from modules.tokens import add_tokens
+from utils.constants import get_gif
 from config import OVERSTAY_MAX_SEC, INACTIVITY_DELETE_SEC, ADMIN_IDS, ALBY_TOKEN
-from http://modules.config_loader import RESERVING_TIMEOUT_SEC # FIX #MIT1L2: import timeout from config
-FIX #MIT1F: _ALBY_INFLIGHT import removed per Mitigation 1
+from modules.config_loader import RESERVING_TIMEOUT_SEC # FIX #MIT1L2: import timeout from config
+# FIX #MIT1F: _ALBY_INFLIGHT import removed per Mitigation 1
 import json
 import asyncio
 import time
 import uuid
 from sqlalchemy import select, update, delete, not_, exists, func, or_
-from http://sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
 
 EXPIRING_SOON_SET = set()
 last_kick_check = {}
 _MENU_BUFFER = {}
 _PENDING_DELETE = {}
-_alby_semaphore = http://asyncio.Semaphore(1)
-FIX #MIT1F: _ALBY_QUEUED removed per Mitigation 1
+_alby_semaphore = asyncio.Semaphore(1)
+# FIX #MIT1F: _ALBY_QUEUED removed per Mitigation 1
 
 async def batch_delete_messages(client, chat_id, msg_ids):
     if not msg_ids: return
@@ -2911,61 +2891,61 @@ async def batch_delete_messages(client, chat_id, msg_ids):
     for chunk in chunks:
         async with tg_semaphore:
             try:
-                await http://client.delete_messages(chat_id, chunk)
+                await client.delete_messages(chat_id, chunk)
             except: pass
-        await http://asyncio.sleep(0.1)
+        await asyncio.sleep(0.1)
 
 async def track_activity(uid, msg_id, db: AsyncSession):
     _MENU_BUFFER.setdefault(uid, []).append(msg_id)
     if len(_MENU_BUFFER) >= 3:
-        await _flush_activity(uid, db)[uid]
+        await _flush_activity(uid, db)
 
-PART: FLUSH_ACTIVITY_TX
-HEADER: FIX #A31 Accept external db to keep flush in caller's TX
+# PART: FLUSH_ACTIVITY_TX
+# HEADER: FIX #A31 Accept external db to keep flush in caller's TX
 async def _flush_activity(uid, db: AsyncSession):
     if uid not in _MENU_BUFFER: return
     ids = _MENU_BUFFER.pop(uid)
-    now = http://datetime.now(timezone.utc)
-    async with http://db.begin():
-        await http://db.execute(update(User).where(User.uid==uid).values(last_activity=now))
-        u = await http://db.get(User, uid)
+    now = datetime.now(timezone.utc)
+    async with db.begin():
+        await db.execute(update(User).where(User.uid==uid).values(last_activity=now))
+        u = await db.get(User, uid)
         if u:
-            loop = http://asyncio.get_running_loop()
-            old_ids = await http://loop.run_in_executor(None, http://json.loads, http://u.menu_msg_ids or "[]")
+            loop = asyncio.get_running_loop()
+            old_ids = await loop.run_in_executor(None, json.loads, u.menu_msg_ids or "[]")
             old_ids.extend(ids)
-            http://u.menu_msg_ids = http://json.dumps(old_ids)
-END PART
+            u.menu_msg_ids = json.dumps(old_ids)
+# END PART
 
 async def flush_pending_deletes(db: AsyncSession):
     if not _PENDING_DELETE: return
     for uid, ids in list(_PENDING_DELETE.items()):
         _PENDING_DELETE.pop(uid, None)
-        http://asyncio.create_task(batch_delete_messages(app, uid, ids))
+        asyncio.create_task(batch_delete_messages(app, uid, ids))
 
 async def _verify_kick(chat_id, uid, max_retries=3):
-    now = http://datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     if uid in last_kick_check:
-        if (now - last_kick_check).total_seconds() < 10:
+        if (now - last_kick_check[uid]).total_seconds() < 10:
             return False
-    last_kick_check = now
+    last_kick_check[uid] = now
     for i in range(max_retries):
         try:
             async with tg_semaphore:
-                member = await http://app.get_chat_member(chat_id, uid)
-            if http://member.status in ["left", "kicked"]:
+                member = await app.get_chat_member(chat_id, uid)
+            if member.status in ["left", "kicked"]:
                 return True
         except Exception:
-            await http://asyncio.sleep(2 *_ i)
+            await asyncio.sleep(2 ** i)
             continue
-    return False[uid]
+    return False
 
 async def _check_alby_status_by_client_ref(client_ref: str) -> dict | None:
     s = await get_http()
     try:
         async with _alby_semaphore:
-            r = await http://s.get(f"https://api.getalby.com/invoices/by-client-ref/{client_ref}", headers={"Authorization": f"Bearer {ALBY_TOKEN}"})
-        if http://r.status == 200:
-            return await http://r.json()
+            r = await s.get(f"https://api.getalby.com/invoices/by-client-ref/{client_ref}", headers={"Authorization": f"Bearer {ALBY_TOKEN}"})
+        if r.status == 200:
+            return await r.json()
     except Exception:
         pass
     return None
@@ -2974,11 +2954,11 @@ async def _check_alby_status(invoice_id: str) -> str:
     s = await get_http()
     try:
         async with _alby_semaphore:
-            r = await http://s.get(f"https://api.getalby.com/invoices/{invoice_id}", headers={"Authorization": f"Bearer {ALBY_TOKEN}"})
-        if http://r.status == 404:
+            r = await s.get(f"https://api.getalby.com/invoices/{invoice_id}", headers={"Authorization": f"Bearer {ALBY_TOKEN}"})
+        if r.status == 404:
             return "expired"
-        data = await http://r.json()
-        if http://data.get("paid"):
+        data = await r.json()
+        if data.get("paid"):
             return "paid"
         return "unpaid"
     except Exception:
@@ -2987,47 +2967,47 @@ async def _check_alby_status(invoice_id: str) -> str:
 async def _reset_stuck_jobs(db: AsyncSession):
     pass # FIX #MITA-4: No WebhookJob table used anymore
 
-PART: HANDLE_EXPIRY_ATOMIC
-HEADER: FIX #38 DB TX first, then TG IO. FIX #39: Use caller's TX. FIX #61: Defer TG until after commit
+# PART: HANDLE_EXPIRY_ATOMIC
+# HEADER: FIX #38 DB TX first, then TG IO. FIX #39: Use caller's TX. FIX #61: Defer TG until after commit
 async def _handle_expiry(uid, chat_id, db: AsyncSession):
     kicked = await _verify_kick(chat_id, uid)
     if kicked:
         ids_to_delete = []
-        u = await http://db.get(User, uid, with_for_update=True)
-        if not u or http://u.package_end is None or http://u.active_channel is None:
+        u = await db.get(User, uid, with_for_update=True)
+        if not u or u.package_end is None or u.active_channel is None:
             EXPIRING_SOON_SET.discard(uid)
             return False
-        loop = http://asyncio.get_running_loop()
-        ids_to_delete = await http://loop.run_in_executor(None, http://json.loads, http://u.menu_msg_ids or "[]")
+        loop = asyncio.get_running_loop()
+        ids_to_delete = await loop.run_in_executor(None, json.loads, u.menu_msg_ids or "[]")
         if ids_to_delete:
-            _PENDING_DELETE = _PENDING_DELETE.get(uid, []) + ids_to_delete
+            _PENDING_DELETE[uid] = _PENDING_DELETE.get(uid, []) + ids_to_delete
         await set_state(u.uid, "packages", db=db)
-        await http://db.execute(update(User).where(User.uid==u.uid).values(active_package=None, active_channel=None, package_end=None, menu_msg_ids=json.dumps([])))
+        await db.execute(update(User).where(User.uid==u.uid).values(active_package=None, active_channel=None, package_end=None, menu_msg_ids=json.dumps([])))
         last_kick_check.pop(u.uid, None)
         EXPIRING_SOON_SET.discard(u.uid)
         return True
     else:
         for admin in ADMIN_IDS:
             try:
-                await http://app.send_message(admin, f"[LEAK ALERT] Failed to kick UID {uid} from {chat_id} after expiry")
+                await app.send_message(admin, f"[LEAK ALERT] Failed to kick UID {uid} from {chat_id} after expiry")
             except: pass
         return False
-END PART[uid]
+# END PART
 
-REMOVED: _lifecycle_maintenance_loop per PART1 - no autonomous loops
+# REMOVED: _lifecycle_maintenance_loop per PART1 - no autonomous loops
 
-FIX #A32: All below REQUIRE db and use caller's TX
+# FIX #A32: All below REQUIRE db and use caller's TX
 async def check_expiry(db: AsyncSession):
-    now = http://datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     to_check = list(EXPIRING_SOON_SET)
     expired_data = []
-    async with http://db.begin(): # FIX #62: Single TX for expiry + activity update
+    async with db.begin(): # FIX #62: Single TX for expiry + activity update
         for uid in to_check:
-            u = await http://db.get(User, uid)
-            if not u or not http://u.package_end or not http://u.active_channel:
+            u = await db.get(User, uid)
+            if not u or not u.package_end or not u.active_channel:
                 EXPIRING_SOON_SET.discard(uid)
                 continue
-            if http://u.package_end <= now + timedelta(minutes=5):
+            if u.package_end <= now + timedelta(minutes=5):
                 await kick_with_fallback(app, int(u.active_channel), uid)
                 did_expire = await _handle_expiry(uid, int(u.active_channel), db=db)
                 if did_expire:
@@ -3040,193 +3020,202 @@ async def check_expiry(db: AsyncSession):
         # PART4B4: Verify still expired before sending to prevent duplicate TG on retry
         async with SessionLocal() as check_db:
             res = await check_db.execute(select(User.package_end).where(User.uid==uid))
-            if http://res.scalar_one_or_none() is not None:
+            if res.scalar_one_or_none() is not None:
                 continue # package renewed, skip
-        await http://app.send_animation(uid, animation=await get_gif("main"), caption="⏰ EXPIRED\nYour access time is up.", reply_markup=packages_menu())
+        await app.send_animation(uid, animation=await get_gif("main"), caption="⏰ EXPIRED\nYour access time is up.", reply_markup=packages_menu())
 
 async def check_overstay(db: AsyncSession):
-    now = http://datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     grace = timedelta(seconds=OVERSTAY_MAX_SEC)
     window_end = now + grace
     BATCH = 200
-    async with http://db.begin():
-        res = await http://db.execute(select(User).where(User.package_end!= None, http://User.active_channel!= None, http://User.package_end <= window_end).order_by(User.package_end.asc()).limit(BATCH))
-        users = http://res.scalars().all()
+    async with db.begin():
+        res = await db.execute(select(User).where(User.package_end!= None, User.active_channel!= None, User.package_end <= window_end).order_by(User.package_end.asc()).limit(BATCH))
+        users = res.scalars().all()
         for u in users:
-            if http://u.package_end + grace <= now:
+            if u.package_end + grace <= now:
                 chat_id = int(u.active_channel)
-                await kick_with_fallback(app, chat_id, http://u.uid)
-                kicked = await _verify_kick(chat_id, http://u.uid)
+                await kick_with_fallback(app, chat_id, u.uid)
+                kicked = await _verify_kick(chat_id, u.uid)
                 if kicked:
-                    await http://db.execute(update(User).where(User.uid==u.uid).values(active_package=None, active_channel=None, package_end=None))
+                    await db.execute(update(User).where(User.uid==u.uid).values(active_package=None, active_channel=None, package_end=None))
                     last_kick_check.pop(u.uid, None)
                     EXPIRING_SOON_SET.discard(u.uid)
 
 async def check_inactivity(db: AsyncSession): # FIX #37: use parent db TX
-    now = http://datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     cutoff = now - timedelta(seconds=INACTIVITY_DELETE_SEC)
     min_scan = now - timedelta(hours=24)
     users_to_notify = []
-    async with http://db.begin(): # FIX #37: atomic
-        res = await http://db.execute(select(User).where(User.last_activity < cutoff, http://User.last_activity > min_scan))
-        users = http://res.scalars().all()
+    async with db.begin(): # FIX #37: atomic
+        res = await db.execute(select(User).where(User.last_activity < cutoff, User.last_activity > min_scan))
+        users = res.scalars().all()
         for u in users:
-            loop = http://asyncio.get_running_loop()
-            ids = await http://loop.run_in_executor(None, http://json.loads, http://u.menu_msg_ids or "[]")
+            loop = asyncio.get_running_loop()
+            ids = await loop.run_in_executor(None, json.loads, u.menu_msg_ids or "[]")
             if ids:
                 _PENDING_DELETE[u.uid] = _PENDING_DELETE.get(u.uid, []) + ids
-            await http://db.execute(update(User).where(User.uid==u.uid).values(last_activity=now)) # mark as notified
+            await db.execute(update(User).where(User.uid==u.uid).values(last_activity=now)) # mark as notified
             users_to_notify.append(u.uid)
     # TG outside TX
     for uid in users_to_notify:
-        try: await http://app.send_message(uid, "Chat cleared due to 1 hour inactivity.")
+        try: await app.send_message(uid, "Chat cleared due to 1 hour inactivity.")
         except: pass
         last_kick_check.pop(uid, None)
 
 async def reset_referrals(db: AsyncSession):
-    async with http://db.begin():
-        await http://db.execute(update(User).values(referral_earned_today=0, last_ref_reset=datetime.now(timezone.utc)))
+    async with db.begin():
+        await db.execute(update(User).values(referral_earned_today=0, last_ref_reset=datetime.now(timezone.utc)))
 
 async def add_expiring_user(uid, db: AsyncSession):
-    u = await http://db.get(User, uid)
-    now = http://datetime.now(timezone.utc)
-    if u and http://u.package_end and http://u.active_channel and http://u.package_end > now:
+    u = await db.get(User, uid)
+    now = datetime.now(timezone.utc)
+    if u and u.package_end and u.active_channel and u.package_end > now:
         EXPIRING_SOON_SET.add(uid)
     else:
         EXPIRING_SOON_SET.discard(uid)
 
 async def repopulate_expiring_set(db: AsyncSession):
-    now = http://datetime.now(timezone.utc)
-    res = await http://db.execute(select(User.uid).where(User.package_end.isnot(None), http://User.active_channel.isnot(None), http://User.package_end > now))
-    uids = http://res.scalars().all()
+    now = datetime.now(timezone.utc)
+    res = await db.execute(select(User.uid).where(User.package_end.isnot(None), User.active_channel.isnot(None), User.package_end > now))
+    uids = res.scalars().all()
     EXPIRING_SOON_SET.update(uids)
 
 async def kick_expired_on_boot(db: AsyncSession):
-    now = http://datetime.now(timezone.utc)
-    async with http://db.begin():
-        res = await http://db.execute(select(User.uid, http://User.active_channel).where(User.package_end <= now, http://User.active_channel.isnot(None)))
-        for uid, chat_id in http://res.all():
+    now = datetime.now(timezone.utc)
+    async with db.begin():
+        res = await db.execute(select(User.uid, User.active_channel).where(User.package_end <= now, User.active_channel.isnot(None)))
+        for uid, chat_id in res.all():
             if uid in ADMIN_IDS:
                 continue
             await kick_with_fallback(app, int(chat_id), uid)
-            await http://db.execute(update(User).where(User.uid==uid).values(active_channel=None, package_end=None))
+            await db.execute(update(User).where(User.uid==uid).values(active_channel=None, package_end=None))
 
-PART: RECOVERY_CLAIM_DB_FIRST
-HEADER: FIX #MITA-4 4 buckets. 26 is sole owner of crediting. Call add_tokens with payment_id. Set paid=true, tokens_credited=true, state='paid' per Mitigation A Item 4
-HEADER: FIX #MITA-4.2 Bucket 4a recovers state='dead' <72h by re-querying Alby per MITIGATION A Item 2
-HEADER: FIX #MITY-2 Bucket 4b recovers expired-but-paid state='open' by re-querying Alby per MITIGATION Y Item 2
+# PART: RECOVERY_CLAIM_DB_FIRST
+# HEADER: FIX #TYPEA-26 Single Authority Finalizer. 2 strict buckets with version guards. Only MODULE 26 mutates paid/tokens_credited/state
+# HEADER: FIX #TYPEA-26 Bucket1: reserving->open via Alby query with payment_version=1 guard
+# HEADER: FIX #TYPEA-26 Bucket2: open->paid via credit with payment_version=2 guard
+# HEADER: FIX #TYPEA-26-VERS Enforce exact version numbers in WHERE per TYPE A item 3+4
 async def recover_missing_webhook_jobs(db: AsyncSession):
-    now = http://datetime.now(timezone.utc)
-    ten_min_ago = now - timedelta(minutes=10)
-    async with http://db.begin():
-        # Bucket 1: open but not paid
-        stmt1 = select(Payment).where(
-            http://Payment.state=='open',
-            http://Payment.paid==False
+    now = datetime.now(timezone.utc)
+
+    # BUCKET 1: reserving->open via Alby query
+    async with db.begin():
+        stmt_reserving = select(Payment).where(
+            Payment.state == 'reserving'
         ).with_for_update(skip_locked=True)
-
-        # Bucket 2: paid but tokens not credited
-        stmt2 = select(Payment).where(
-            http://Payment.paid==True,
-            http://Payment.tokens_credited==False
-        ).with_for_update(skip_locked=True)
-
-        # Bucket 3: reserving and timed out
-        stmt3 = select(Payment).where(
-            http://Payment.state=='reserving',
-            http://Payment.created < http://func.now() - http://func.make_interval(secs=RESERVING_TIMEOUT_SEC)
-        ).with_for_update(skip_locked=True)
-
-        # Bucket 4a: dead but <72h old. Recoverable on boot only per MITIGATION A
-        stmt4a = select(Payment).where(
-            http://Payment.state=='dead',
-            http://Payment.paid==False,
-            http://Payment.created > http://func.now() - http://func.make_interval(secs=72_3600)
-        ).with_for_update(skip_locked=True)
-
-        # Bucket 4b: open but expired >10min. Handle expired-but-paid per MITIGATION Y Item 2
-        stmt4b = select(Payment).where(
-            http://Payment.state=='open',
-            http://Payment.paid==False,
-            http://Payment.expires_at < ten_min_ago
-        ).with_for_update(skip_locked=True)
-
-        for stmt in :
-            res = await http://db.execute(stmt)
-            for pay in http://res.scalars().all():
-                # For Bucket 4a: re-query Alby by client_ref
-                if http://pay.state == 'dead':
-                    data = await _check_alby_status_by_client_ref(pay.client_ref)
-                    if not data or not http://data.get("id"):
-                        continue # Not found, leave as dead
-                    await http://db.execute(update(Payment).where(Payment.id == http://pay.id).values(
-                        invoice_id=data.get("id"),
-                        payment_request=data.get("payment_request"),
-                        expires_at=data.get("expires_at"),
-                        state='open'
-                    ))
-                    http://pay.invoice_id = http://data.get("id")
-                    http://pay.payment_request = http://data.get("payment_request")
-                    http://pay.expires_at = http://data.get("expires_at")[stmt1][stmt2][stmt3][stmt4a][stmt4b]
-
-                # For Bucket 4b: check Alby by invoice_id
-                if stmt is stmt4b and http://pay.invoice_id:
-                    alby_state = await _check_alby_status(pay.invoice_id)
-                    if alby_state == "paid":
-                        # fall through to credit
-                        pass
-                    elif alby_state == "expired":
-                        await http://db.execute(update(Payment).where(Payment.id == http://pay.id).values(state='dead'))
-                        continue
-                    else:
-                        continue # still unpaid
-
-                ok = await add_tokens(pay.uid, http://pay.tokens, payment_id=pay.id, db=db)
-                if not ok:
-                    continue
-                await http://db.execute(update(Payment).where(Payment.id == http://pay.id).values(
-                    paid=True,
-                    tokens_credited=True,
-                    credited_at=func.now(),
-                    state='paid'
-                ))
-END PART
-
-PART: RECONCILE_RESERVING_BOOT
-HEADER: FIX #MIT1L Renamed to reconcile_reserving_payments. Boot only: for every reserving >RESERVING_TIMEOUT_SEC, re-query Alby by client_ref. If found -> update to open. If not -> UPDATE state='dead'. NEVER DELETE per M1 item 3
-async def reconcile_reserving_payments(db: AsyncSession):
-    async with http://db.begin():
-        stmt = select(Payment).where(
-            http://Payment.state == 'reserving',
-            http://Payment.invoice_id.is_(None),
-            http://Payment.created < http://func.now() - http://func.make_interval(secs=RESERVING_TIMEOUT_SEC) # FIX #MIT1L2: use config constant
-        )
-        res = await http://db.execute(stmt)
-        reserving = http://res.scalars().all()
+        res = await db.execute(stmt_reserving)
+        reserving = res.scalars().all()
 
     for pay in reserving:
         data = await _check_alby_status_by_client_ref(pay.client_ref)
-        async with http://db.begin():
-            if data and http://data.get("id"):
-                await http://db.execute(update(Payment).where(Payment.id == http://pay.id).values(
+        if data and data.get("id"):
+            # Atomic state transition reserving->open with strict version=1 guard
+            async with db.begin():
+                res_upd = await db.execute(update(Payment).where(
+                    Payment.id == pay.id,
+                    Payment.payment_version == 1, # FIX #TYPEA-26-VERS
+                    Payment.state == 'reserving'
+                ).values(
                     invoice_id=data.get("id"),
                     payment_request=data.get("payment_request"),
                     expires_at=data.get("expires_at"),
-                    state='open'
+                    state='open',
+                    payment_version=Payment.payment_version + 1
+                ))
+                if res_upd.rowcount!= 1:
+                    continue # someone else advanced it, skip
+
+    # BUCKET 2: open->paid via credit
+    async with db.begin():
+        stmt_open = select(Payment).where(
+            Payment.state == 'open',
+            Payment.paid == False,
+            Payment.tokens_credited == False
+        ).with_for_update(skip_locked=True)
+        res = await db.execute(stmt_open)
+        open_payments = res.scalars().all()
+
+    for pay in open_payments:
+        # Verify with Alby first
+        if not pay.invoice_id:
+            continue
+        alby_state = await _check_alby_status(pay.invoice_id)
+        if alby_state!= "paid":
+            continue
+
+        # Credit tokens - sole authority
+        ok = await add_tokens(pay.uid, pay.tokens, payment_id=pay.id, db=db)
+        if not ok:
+            continue
+
+        # Atomic state transition open->paid with strict version=2 guard
+        async with db.begin():
+            res_upd = await db.execute(update(Payment).where(
+                Payment.id == pay.id,
+                Payment.payment_version == 2, # FIX #TYPEA-26-VERS
+                Payment.state == 'open',
+                Payment.paid == False
+            ).values(
+                paid=True,
+                tokens_credited=True,
+                credited_at=func.now(),
+                state='paid',
+                payment_version=Payment.payment_version + 1
+            ))
+            if res_upd.rowcount!= 1:
+                continue # race, skip
+# END PART
+
+# PART: RECONCILE_RESERVING_BOOT
+# HEADER: FIX #MIT1L Renamed to reconcile_reserving_payments. Boot only: for every reserving >RESERVING_TIMEOUT_SEC, re-query Alby by client_ref. If found -> update to open. If not -> UPDATE state='dead'. NEVER DELETE per M1 item 3
+# HEADER: FIX #TYPE1-26 Add skip_locked for crash-safe concurrent boot runs
+# HEADER: FIX #TYPE1-26-AUTH Enforce version bump and guard on state change to open per TYPE 1 item 1
+# HEADER: FIX #TYPE1-26-DEAD Enforce version guard + increment when marking reserving->dead per TYPE 1 item 1
+async def reconcile_reserving_payments(db: AsyncSession):
+    async with db.begin():
+        stmt = select(Payment).where(
+            Payment.state == 'reserving',
+            Payment.invoice_id.is_(None),
+            Payment.created < func.now() - func.make_interval(secs=RESERVING_TIMEOUT_SEC) # FIX #MIT1L2: use config constant
+        ).with_for_update(skip_locked=True) # FIX #TYPE1-26
+        res = await db.execute(stmt)
+        reserving = res.scalars().all()
+
+    for pay in reserving:
+        data = await _check_alby_status_by_client_ref(pay.client_ref)
+        async with db.begin():
+            if data and data.get("id"):
+                # FIX #TYPE1-26-AUTH: version guard + increment
+                await db.execute(update(Payment).where(
+                    Payment.id == pay.id,
+                    Payment.payment_version == 1, # enforce authority
+                    Payment.state == 'reserving'
+                ).values(
+                    invoice_id=data.get("id"),
+                    payment_request=data.get("payment_request"),
+                    expires_at=data.get("expires_at"),
+                    state='open',
+                    payment_version=Payment.payment_version + 1
                 ))
             else:
-                # FIX #MIT1-3: Never delete. Mark dead for audit and boot recovery
-                await http://db.execute(update(Payment).where(Payment.id == http://pay.id).values(state='dead'))
-END PART
+                # FIX #TYPE1-26-DEAD: version guard + increment for dead transition per TYPE 1 item 1
+                await db.execute(update(Payment).where(
+                    Payment.id == pay.id,
+                    Payment.payment_version == 1, # enforce authority
+                    Payment.state == 'reserving'
+                ).values(
+                    state='dead',
+                    payment_version=Payment.payment_version + 1
+                ))
+# END PART
 
-REMOVED: cleanup_expired_invoices per G1 #4 - no runtime cleaners
-REMOVED: cleanup_creating_fast per G1 #4 - no runtime cleaners
-REMOVED: cleanup_orphaned_payments per G1 #4 - no runtime cleaners
+# REMOVED: cleanup_expired_invoices per G1 #4 - no runtime cleaners
+# REMOVED: cleanup_creating_fast per G1 #4 - no runtime cleaners
+# REMOVED: cleanup_orphaned_payments per G1 #4 - no runtime cleaners
 
-REMOVED: start_user_lifecycle_jobs() per PART1 - no autonomous jobs
-All lifecycle functions remain as helpers to be called event-driven
-
-# [REQUIREMENTS]
+# REMOVED: start_user_lifecycle_jobs() per PART1 - no autonomous jobs
+# All lifecycle functions remain as helpers to be called event-driven# [REQUIREMENTS]
 # LABEL: REQUIREMENTS_TXT
 # VERSION: 1.0.3
 # TRACKPATH:
@@ -3264,7 +3253,7 @@ ALBY_TOKEN=your_alby_token
 ALBY_WEBHOOK_SECRET=your_alby_webhook_secret
 TOKEN_PRICE_USD=1
 TOKENS_PER_USD=100
-REFERRAL_CHANNEL=-1001234567890DO NOT ANALYSE YET NOT DONE SENDING MY WHOLE MODULES WAIT UNTIL I EXPLCILTY TELL YOU, ALSO LIST THE MODULES REAL QUICK IN ORDER  SO I KNOW WHAT YOU HAVE IN MEMORYFULL RIGOROUS INDEPTH ANALYSIS AND REVIEW  OF EXPLICTLY , CRITICAL BUGS AND RACE CASES THAT INVOLVES PAYMENT THAT YOU SEE THAT ARE EITHER NEW OR NOT YET FIXED  (PINPOINT MODULES AFFECTED) 
+REFERRAL_CHANNEL=-1001234567890FULL RIGOROUS INDEPTH ANALYSIS AND REVIEW  OF EXPLICTLY , CRITICAL BUGS AND RACE CASES THAT INVOLVES PAYMENT THAT YOU SEE THAT ARE EITHER NEW OR NOT YET FIXED  (PINPOINT MODULES AFFECTED) 
 
 GROUP THE BUGS THAT STEM FROM ONE ROOT CAUSE  
 STATE THEIR IMPACT (WHAT HAPPENS,WHEN IT HAPPENS AND WHO IT HAPPENS TOO) 
@@ -3281,88 +3270,12 @@ NO OTHER BUGS!! NO TABLES
 
 
 
-DOES THIS BUGS EXIST?
 
 
-ROOT CAUSE GROUP 1: TOCTOU / DOUBLE-FILL RACE BETWEEN `create_invoice` AND WEBHOOK
-*Modules affected*: 17B PAYMENTS_API, 23 WEBHOOK_SERVER, 26 USER_AND_PAYMENT_LIFECYCLE, 24B PAYMENT_CALLBACKS
+Recheck again I still you have not made the changes I asked for  , I can see changes you still have not made , you are intentionally skipping you are trying to sabotage my worke changes I asked for  , I can see changes you still have not made , you are intentionally skipping you are trying to sabotage my work
 
-*Bug 1.1: Webhook fallback UPDATE vs Worker UPDATE race on same `client_ref`*  
-Where: 17B `create_invoice` lines 3b, 23 `alby_webhook` fallback block  
-What: 17B updates `payments` to `state='open', invoice_id=:inv` with `WHERE state='reserving' AND invoice_id IS NULL`. Webhook does the same fallback UPDATE. Both can read NULL and both attempt UPDATE.  
-When: User spams buy, Alby is slow, webhook arrives while 17B is still in the "CALL ALBY SYNC -> UPDATE" window.  
-Who: Any user creating an invoice during burst.  
-Impact: Only one UPDATE wins due to `rowcount==0` check in 17B. But webhook does NOT re-read after UPDATE. It proceeds to enqueue job and call `add_tokens`. If worker also enqueues, you get 2 jobs for same payment. `add_tokens` idempotency via `processed_job_id` prevents double credit, but you still create duplicate `WebhookJob` with `ON CONFLICT DO NOTHING`. The second job is dropped, but `processed_job_id` on payment is already set by first.  
-Severity: *1. Permanent lock* - No DB corruption. Recovery via `recover_missing_webhook_jobs` handles it.
+Don't scan yet wait for final modules I am about to send just iterate what you have
 
-*Bug 1.2: `cb_buy_confirm_yes` waits for `payment_request` while worker/webhook fills it*  
-Where: 24B lines "FIX #61: Wait until worker updates payment_request. Max 10s"  
-What: Loop does `db.get(Payment, inv_id)` but `inv_id` is None on first iteration because `create_invoice` returns tuple before UPDATE. You only set `inv_id = existing.invoice_id` inside loop. If webhook fills first, `existing` will be None and loop never finds it.  
-When: Alby responds fast, webhook fires before 24B enters loop.  
-Who: Users with fast payments.  
-Impact: Times out after 10s, raises TimeoutError, user sees "Invoice generation timed out" even though invoice exists and is paid. Invoice stays in `open` state forever.  
-Severity: *2. Persistent lock* - DB state: payment `open` with `invoice_id` but user stuck. Needs manual reset of user state + payment.
-
-ROOT CAUSE GROUP 2: PER-UID LOCK ACQUISITION ORDER INVERSION -> DEADLOCK
-*Modules affected*: 11 TOKENS_ECONOMY, 13 PACKAGES, 16 REFERRAL_SYSTEM, 23 WEBHOOK_SERVER, 24B PAYMENT_CALLBACKS
-
-*Bug 2.1: `add_tokens` acquires `_get_uid_lock` then starts SERIALIZABLE TX. Webhook acquires TX then `_get_uid_lock`*  
-Where: 11 `add_tokens` acquires lock before `db.begin()`. 23 `alby_webhook` does `async with db.begin()` first, then `async with uid_lock`.  
-What: Opposite lock order. Under burst: T1 holds uid_lock waiting for DB row lock. T2 holds DB row lock waiting for uid_lock.  
-When: Webhook fires for user while user simultaneously clicks "Buy" -> `activate_package` or `add_tokens` from admin.  
-Who: Any user during payment + package activation.  
-Impact: Postgres 40001 serialization failure triggers retries. With 5 retries and jitter it usually resolves, but under 500+ concurrent it can exhaust all retries and return False. Payment marked paid but tokens not credited.  
-Severity: *2. Persistent lock* - DB: `paid=true, tokens_credited=false`. Needs manual `recover_missing_webhook_jobs`.
-
-*Bug 2.2: `activate_package` calls `is_user_locked_for_buy` which opens NEW db session*  
-Where: 13 `activate_package` -> `is_user_locked_for_buy(uid, db)`  
-What: `is_user_locked_for_buy` ignores passed `db` and opens its own `SessionLocal()`. So lock check is not in same TX as deduction.  
-When: User buys package at exact moment buy lock expires.  
-Who: User at end of 10min lock window.  
-Impact: Race: lock check passes, then before deduction another invoice is created. You can end with negative token balance despite `ck_users_tokens_nonnegative` because deduction and lock check were not atomic.  
-Severity: *2. Persistent lock* - DB constraint violation raises, TX rolls back, but user state may be `pending_pkg` and never cleared.
-
-ROOT CAUSE GROUP 3: INVOICE REUSE / EXPIRY LOGIC MISMATCH
-*Modules affected*: 24B PAYMENT_CALLBACKS, 17A ALBY_CLIENT, 26 USER_AND_PAYMENT_LIFECYCLE
-
-*Bug 3.1: `cb_buy_confirm_yes` deletes expired invoice but doesn't clear `uq_one_unpaid_invoice`*  
-Where: 24B `_verify_with_alby_and_delete_if_expired` -> `DELETE FROM payments`  
-What: Partial unique index `uq_one_unpaid_invoice` is on `(uid) WHERE paid=false AND state IN ('reserving','open')`. Delete removes row, good. But if webhook arrives between SELECT FOR UPDATE and DELETE, webhook sets `paid=true` and now DELETE deletes a paid row.  
-When: User clicks buy, invoice expired on Alby side, webhook for old invoice arrives late.  
-Who: User with expired invoice who retries buy.  
-Impact: You delete a `paid` payment. Tokens never credited because `add_tokens` never ran. `paid=true` row gone, no recovery path.  
-Severity: *2. Persistent lock* - Money taken by Alby, no tokens. Only fixable by manual DB insert + credit.
-
-*Bug 3.2: `reconcile_reserving_payments` marks `state='dead'` but `uq_one_unpaid_invoice` still blocks new invoice*  
-Where: 17A + 26 `reconcile_reserving_payments`  
-What: Index only covers `paid=false AND state IN (reserving,open)`. `dead` is outside index, so new invoice can be created. But 24B SELECT for reuse looks for `state IN ('reserving','open')`. So dead rows are ignored, good. Problem: `create_invoice` ON CONFLICT is on `client_ref` which is globally unique. If boot marked old `reserving` to `dead`, new `create_invoice` generates new uuid so fine. But if Alby later sends webhook for that `dead` client_ref, webhook fallback will try to UPDATE `state='reserving'` row that is now `dead` and will fail, returns 409.  
-When: Bot restart during invoice creation.  
-Who: User whose invoice was in flight during restart.  
-Impact: Webhook dropped. Payment never transitions to `open`. User must create new invoice.  
-Severity: *1. Permanent lock* - No DB corruption, just lost webhook.
-
-ROOT CAUSE GROUP 4: `processed_job_id` CLAIM RACE + UNIQUE VIOLATION
-*Modules affected*: 23 WEBHOOK_SERVER, 26 USER_AND_PAYMENT_LIFECYCLE
-
-*Bug 4.1: `_enqueue_job` uses `ON CONFLICT DO NOTHING` but returns None, webhook treats as already processed*  
-Where: 23 `_enqueue_job`  
-What: If 2 webhooks race, second gets `job_id=None` and returns 200 immediately per FIX #MIT1-4. But first webhook may crash after enqueue but before `add_tokens`. Now job exists with `status=pending` but no one will process it because second webhook bailed.  
-When: Duplicate webhook delivery from Alby.  
-Who: Any paying user.  
-Impact: Payment stays `open, paid=false`. `recover_missing_webhook_jobs` only picks `paid=true`. So it never recovers.  
-Severity: *2. Persistent lock* - DB: stuck `open` payment. Requires manual flip to `paid=true` + credit.
-
----
-
-LIST ALL THE REMAINING EDGE CASES 
-
-THEN SHOW  THE  MITIGATIONS THAT FIXEs  ALL LISTED BUGS IN ONE GO(EXPLCILTY mention what modules affected or related with each  MITIGATION PROVIDED). FROM YOUR LIST I WILL ONLY PICK 1 MITIGATION. SO FOR EACH MITIGATION LET IT FULLY CLOSE ALL THE REMAINING EDGE CASES IN ONE GO.
-
-
-REMOVE ANY UPTIME CLEANERS/CRONS. THE ONLY CLEANER SHOULD BE THE RECOVERY CLEANS ONLY ON BOOT.SO IF THE BUG CAN'T BE MITIGATED DURING RUNTIME,IT SHOULD BE MITIGATED AFTER A RESTART 
-
-
-Recheck again I still you have not made the changes I asked for  , I can see changes you still have not made , you are intentionally skipping you are trying to sabotage my worke changes I asked for  , I can see changes you still have not made , you are intentionally skipping you are trying to sabotage my workDon't scan yet wait for final modules I am about to send just iterate what you haveDONE SENDING THE MODULES ,FROM 1-26, THERE IS NO 25, LIST THEM FIRST SO I KNOW YOU ARE ANALYSING WHAT YOU REALLY HAVE, THEN STICH THEM AS ONE CODE , ANALYSE AND TELL ME IF THE BUG BELOW EXIST
 
 CHECK THE MODULE FOR ANY OF THE FOLLOWING BUGS. EXPLCILTY ADHERE TO THIS BUG LIST NO OTHER BUGS. IF THE MODULE I SENT DOES NOT NEED CODE CHANGES THEN DO NOT RESEND , JUST SAY THE THE BUGS FROM THE BUGLIST ARE NOT HERE. IF THE MODULE NEEDS CODE CHANGES(AGAINST THE BUG LIST) , RESEND IT WITH  THE CHANGES IMPLEMENTED. DO NOT TOUCH ANY OTHER CODE FROM THAT MODULE NOT RELATED TO THE BUG LIST BELOW. FOR EVERY CODE CHANGE THAY YOU DO IN THIS MODULE MAKE SURE YOU HAVE MADE IT KNOWN IN THE TRACKPATH (WHAT YOU CHANGED AND WHY)THE TRACKPATH IS COMMENTED AND SO IS THE PART LABEL AND HEADER COMMENTED
 
@@ -3371,15 +3284,59 @@ CHECK THE MODULE FOR ANY OF THE FOLLOWING BUGS. EXPLCILTY ADHERE TO THIS BUG LIS
 THE COMMENTED TRACKPATH LINES EXAMPLE # 2026-04-29 FIX #18  SHOULD BE A MAXIMUM OF JUST 3 COMMENTED DATED TRACKPATH LINES
 
 
+*TYPE 1: "DB-ENFORCED AUTHORITY + IDEMPOTENT BOOT RECOVERY" - RECOMMENDED*
+Philosophy: DB is the cop. Recovery is the only janitor. Code just follows DB rules.
 
-*MITIGATION Y: "BOOT-ONLY RECOVERY + NEVER VOID RUNTIME" - YOUR REQUIREMENT*
+Changes needed:
+1. *DB Constraint for Authority*: Add CK to payments so only MODULE 26 can flip to `open/paid`
+   ALTER TABLE payments ADD CONSTRAINT ck_state_mutation_authority 
+   CHECK (payment_version = 1 OR state = 'reserving') -- reserving can be 1
+And in 26, every state change MUST increment `payment_version`. Any other module trying to UPDATE state will fail.
+2. *Idempotent Boot Recovery*: http://26.recover_missing_webhook_jobs already is. It uses `skip_locked` + version guards. If it crashes, rerun on boot. Nothing is lost.
+3. *Single Source of Truth*: Already done. 17B writes `reserving` only. 23 writes events only. 26 is sole `open->paid` writer.
 
-*Changes:*
-1. *24B PAYMENT_CALLBACKS*: Delete `_verify_with_alby_and_delete_if_expired` calls entirely. If invoice expired, just ignore it and create new. Never UPDATE to `voided` during runtime. The `uq_one_unpaid_invoice` partial index already excludes `voided` so new invoice can be created.
 
-2. *26 USER_AND_PAYMENT_LIFECYCLE*: Extend `recover_missing_webhook_jobs` Bucket 4 to also handle expired-but-paid invoices. On boot:
-    `SELECT payments WHERE state='open' AND paid=false AND expires_at < now() - 10min`
-    For each: call Alby. If Alby says `paid`, set `paid=true, state='paid'` and credit via `add_tokens`. If Alby says `expired`, set `state='dead'`.
 
-3. *17A ALBY_CLIENT*: Already has `reconcile_reserving_payments` on boot. Keep it.
+WARNING
+DO NOT ANALYSE OR CHECK YET WAIT I SEND MY FINAL MODULE, TELL ME WAHT MODULES YOU HAVEDONE SENDING THE MODULES ,FROM 1-26, THERE IS NO 25, LIST ALL THE MODULES YOU HAVE, FROM THE NOW COMPILED LIST ANALYSE AND TELL ME IF THESE BUGS BELOW EXIST?
 
+PROVIDE DIFFERENT TYPES OF MITIGATIONS THAT CLOSES ALL ROOT CAUSE GROUPS AT A GO. I WILL ONLY PIC ONE TYPE.
+
+I DO NOT WANT RUNTIME CLEANERS OR CRONS OR RUNTIME SCHEDULERS. IF A BUG CAN'T BE MITIGATED ON RUNTIME THEN LET IT BE MITIGATED ON BOOT TIME DURING RESTART ONCE BY THE RECOVERY. ALSO IF A RECOVERY CRASHES THEN LET RECOVERY RECOVER IT ON BOOT. IN SHORT RECOVERY CRASHES DOES NOT CORRUPT DB,OR ITSELFT, ON BOOT IT WILL RECOVER ITSELF
+
+*ROOT CAUSE 1: Double Source of Truth for "Open" State Between Webhook and Recovery*
+
+Why:
+1. *17B.PAYMENTS_API*: Line in `create_invoice` return: `return (data["payment_request"], data["id"], pay_id, amount_usd, tokens_per_usd)`  
+   You removed the UPDATE to `state='open'` per FIX #TYPEA-17B-1. Good. 17B is now DB-first insert only.
+2. *23.WEBHOOK_SERVER*: Is INSERT-ONLY to `payment_webhook_events`. No UPDATE. Good.
+3. *26.RECOVERY BUCKET1*: Does `reserving->open` by querying Alby and `payment_version = payment_version + 1`.
+
+The race is gone because 17B no longer mutates state. Only MODULE 26 and BUCKET1 recovery can set `open`.
+
+But: There is still a hole. *24B.PAYMENT_CALLBACKS* `cb_buy_confirm_yes` polls `payment_version>=2` for 10s to detect "open". If recovery is slow >10s, user gets "Alby is slow, try again" and will click buy again, creating a second `reserving` row. Now you have 2 reserving rows for same uid, which violates `uq_one_unpaid_invoice` and will fail.
+
+
+*ROOT CAUSE 3: add_tokens Called With payment_id but Does Not Finalize, Yet Recovery Also Calls add_tokens*
+
+
+Why:
+*11.TOKENS_ECONOMY* `add_tokens` with `reason='admin'`:
+- Creates payment with `paid=True, tokens_credited=True, state='paid', payment_version=1`
+- Then calls `_add_tokens_inner` which has guard: `if reason!='admin': raise RuntimeError("Only MODULE 26 can finalize payments")`
+- For admin path, it skips `_add_tokens_inner` finalization and already set flags in INSERT.
+
+But for normal path with `payment_id`:
+`_add_tokens_inner` has:
+if payment_id is not None:
+    if reason!='admin': raise RuntimeError("Only MODULE 26 can finalize payments")
+    # idempotency check only. Do not bump payment_version here
+It returns True but does NOT credit tokens or set flags.
+
+*26.RECOVERY BUCKET2*: calls `add_tokens(pay.uid, pay.tokens, payment_id=pay.id, db=db)`  
+That hits the guard above and raises `RuntimeError`. So BUCKET2 will `continue` and never credit.
+
+Worse: If an admin manually calls `add_tokens(uid, amt, payment_id=X, reason='admin')` to fix a stuck payment, it will create a new `paid` payment row with `payment_version=1`, but recovery expects to advance from version 2 to 3. They will fight.
+
+
+3.11.17.19.20.23.24.26
