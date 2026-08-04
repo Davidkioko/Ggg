@@ -1,27 +1,18 @@
 
+
+See new posts
+
 # [MODULE 01 - CONFIG_LOADER]
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# --- BOOT ---
+from dotenv import load_dotenvload_dotenv()# --- BOOT ---
 BOOT_LOCKDOWN = True
 RECOVERY_MAX_RUNTIME_SEC = 300
-SYSTEM_LOCKED = False
-
-# --- NEW STATES ---
+SYSTEM_LOCKED = False# --- NEW STATES ---
 USER_LOCK_TIMEOUT_SEC = 600
-RESERVING_TIMEOUT_SEC = 120
-
-# --- MITIGATION A ---
-OCC_RETRIES = 5
-
-# --- TIER MODE ---
+RESERVING_TIMEOUT_SEC = 120# --- MITIGATION A ---
+OCC_RETRIES = 5# --- TIER MODE ---
 BOT_TIER = os.getenv("BOT_TIER", "free").lower()
-IS_PAID = BOT_TIER == "paid"
-
-# Derived limits - single source of truth
+IS_PAID = BOT_TIER == "paid"# Derived limits - single source of truth
 TG_SEMAPHORE = 30 if IS_PAID else 8
 TG_WORKERS = 100 if IS_PAID else 30
 TG_SLEEP_THRESHOLD = 10 if IS_PAID else 5
@@ -31,52 +22,33 @@ DB_MAX_OVERFLOW = 20 if IS_PAID else 5
 DB_POOL_RECYCLE = 300 if IS_PAID else 120
 CLOUDFLARE_PING_SEC = 300 if IS_PAID else 45
 WEBHOOK_TIMEOUT = 15 if IS_PAID else 5
-WEBHOOK_NOTIFY_PARALLEL = 20 if IS_PAID else 5
-
-# --- ALBY ---
-ALBY_RPS = int(os.getenv("ALBY_RPS", "10" if IS_PAID else "3"))
-
-# --- TELEGRAM / BOT ---
+WEBHOOK_NOTIFY_PARALLEL = 20 if IS_PAID else 5# --- ALBY ---
+ALBY_RPS = int(os.getenv("ALBY_RPS", "10" if IS_PAID else "3"))# --- TELEGRAM / BOT ---
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
-
-# --- DATABASE ---
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]# --- DATABASE ---
 DB_URL = os.getenv("DB_URL", "postgresql+asyncpg://postgres:postgres@pgbouncer:6432/vip")
-COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "3"))
-
-# --- PAYMENTS ---
+COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "3"))# --- PAYMENTS ---
 ALBY_TOKEN = os.getenv("ALBY_TOKEN")
-ALBY_WEBHOOK_SECRET = os.getenv("ALBY_WEBHOOK_SECRET", "")
-
-# --- ECONOMY DEFAULTS ---
+ALBY_WEBHOOK_SECRET = os.getenv("ALBY_WEBHOOK_SECRET", "")# --- ECONOMY DEFAULTS ---
 TOKEN_PRICE_USD = float(os.getenv("TOKEN_PRICE_USD", "1"))
 TOKENS_PER_USD = int(os.getenv("TOKENS_PER_USD", "100"))
 NEW_USER_TOKENS = int(os.getenv("NEW_USER_TOKENS", "50"))
 REFERRAL_REWARD = int(os.getenv("REFERRAL_REWARD", "1"))
 DAILY_REF_CAP = int(os.getenv("DAILY_REF_CAP", "15"))
 OVERSTAY_MAX_SEC = int(os.getenv("OVERSTAY_MAX_SEC", "180"))
-INACTIVITY_DELETE_SEC = int(os.getenv("INACTIVITY_DELETE_SEC", "3600"))
-
-# --- CHANNELS ---
+INACTIVITY_DELETE_SEC = int(os.getenv("INACTIVITY_DELETE_SEC", "3600"))# --- CHANNELS ---
 REFERRAL_CHANNEL = os.getenv("REFERRAL_CHANNEL", "")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 BOOT_LOCK_KEY = "vip:boot_lock"
-UID_ACTION_LOCK_TTL = 60
-
-# --- PACKAGES ---
+UID_ACTION_LOCK_TTL = 60# --- PACKAGES ---
 PACKAGES = {
     "10m": {"cost": 12, "real": 600, "internal": 300},
     "30m": {"cost": 28, "real": 1800, "internal": 900},
     "1h": {"cost": 52, "real": 3600, "internal": 1800},
-}
-
-if __name__!= "__main__":
-    print("[MODULE 01 - CONFIG_LOADER] Loaded v1.0.13")
-
-
-# [MODULE 02 - DB_CONNECTION]
+}if __name__!= "__main__":
+    print("[MODULE 01 - CONFIG_LOADER] Loaded v1.0.13")# [MODULE 02 - DB_CONNECTION]
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 from config import (
@@ -105,14 +77,10 @@ async def get_http() -> aiohttp.ClientSession:
     if _http_session:
         await _http_session.close()
         _http_session = Noneif __name__!= "__main__":
-    print("[MODULE 02 - DB_CONNECTION] Loaded v1.1.0")
-
-# [MODULE 03 - DB_MODELS]
+    print("[MODULE 02 - DB_CONNECTION] Loaded v1.1.0")# [MODULE 03 - DB_MODELS]
 from sqlalchemy import Column, Integer, String, BigInteger, DateTime, Boolean, ForeignKey, Text, Index, CheckConstraint, UniqueConstraint, event, DDL, text
 from sqlalchemy.sql import func
-from db.db import Base
-
-class User(Base):
+from db.db import Baseclass User(Base):
     __tablename__ = "users"
     uid = Column(BigInteger, primary_key=True)
     tokens = Column(Integer, default=0)
@@ -138,9 +106,7 @@ class User(Base):
         Index("idx_package_end", "package_end", postgresql_where=(package_end.isnot(None) & (active_channel.isnot(None)))), 
         Index("idx_last_activity", "last_activity"),
         CheckConstraint("tokens >= 0", name="ck_users_tokens_nonnegative"), 
-    )
-
-class Payment(Base):
+    )class Payment(Base):
     __tablename__ = "payments"
     id = Column(Integer, primary_key=True)
     uid = Column(BigInteger, index=True)
@@ -158,24 +124,20 @@ class Payment(Base):
     expires_at = Column(DateTime, nullable=True, index=True) 
     alby_state = Column(String, default="open", index=True)  
     created = Column(DateTime, default=func.now())   
-    payment_version = Column(BigInteger, default=0, nullable=False)
-
-    __table_args__ = (        
-        UniqueConstraint(
-            "uid", 
-            name="uq_one_unpaid_invoice",
-            postgresql_where=((paid.is_(False)) & (tokens_credited.is_(False)) & (state.in_(["reserving", "awaiting_payment", "open"]))) 
-        ),
-        # PATCH 14: Enforce single-flight v1 row per uid
-        Index("uq_uid_payment_v1", "uid", unique=True, postgresql_where=text("payment_version = 1 AND paid = false")),
-        Index("ix_payment_processed_job_id", "processed_job_id"), 
-        CheckConstraint("(paid = false) OR (paid = true AND paid_at IS NOT NULL)", name="ck_paid_requires_paid_at"), 
-        CheckConstraint("state IN ('reserving','awaiting_payment','open','paid','dead')", name="ck_payments_state"),
-        CheckConstraint("(state = 'reserving') OR (payment_version > 0)", name="ck_state_mutation_authority"),       
-        CheckConstraint("(invoice_id IS NULL) OR (payment_version > 0)", name="ck_invoice_single_writer"),
-    )
-
-payment_no_double_credit_ddl = DDL("""
+    payment_version = Column(BigInteger, default=0, nullable=False)__table_args__ = (        
+    UniqueConstraint(
+        "uid", 
+        name="uq_one_unpaid_invoice",
+        postgresql_where=((paid.is_(False)) & (tokens_credited.is_(False)) & (state.in_(["reserving", "awaiting_payment", "open"]))) 
+    ),
+    # PATCH 14: Enforce single-flight v1 row per uid
+    Index("uq_uid_payment_v1", "uid", unique=True, postgresql_where=text("payment_version = 1 AND paid = false")),
+    Index("ix_payment_processed_job_id", "processed_job_id"), 
+    CheckConstraint("(paid = false) OR (paid = true AND paid_at IS NOT NULL)", name="ck_paid_requires_paid_at"), 
+    CheckConstraint("state IN ('reserving','awaiting_payment','open','paid','dead')", name="ck_payments_state"),
+    CheckConstraint("(state = 'reserving') OR (payment_version > 0)", name="ck_state_mutation_authority"),       
+    CheckConstraint("(invoice_id IS NULL) OR (payment_version > 0)", name="ck_invoice_single_writer"),
+)payment_no_double_credit_ddl = DDL("""
 CREATE OR REPLACE FUNCTION prevent_double_credit() RETURNS TRIGGER AS $$
 BEGIN
   IF NEW.tokens_credited = TRUE AND OLD.tokens_credited = TRUE THEN
@@ -183,21 +145,15 @@ BEGIN
   END IF;
   RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS payment_no_double_credit ON payments;
+$$ LANGUAGE plpgsql;DROP TRIGGER IF EXISTS payment_no_double_credit ON payments;
 CREATE TRIGGER payment_no_double_credit 
 BEFORE UPDATE ON payments 
 FOR EACH ROW EXECUTE FUNCTION prevent_double_credit();
 """)
-event.listen(Payment.__table__, 'after_create', payment_no_double_credit_ddl)
-
-class Setting(Base):
+event.listen(Payment.__table__, 'after_create', payment_no_double_credit_ddl)class Setting(Base):
     __tablename__ = "settings"
     key = Column(String, primary_key=True)
-    value = Column(String)
-
-class WebhookJob(Base):
+    value = Column(String)class WebhookJob(Base):
     __tablename__ = "webhook_jobs"
     id = Column(Integer, primary_key=True, autoincrement=True)
     uid = Column(BigInteger, index=True)
@@ -207,26 +163,16 @@ class WebhookJob(Base):
     created = Column(DateTime, default=func.now(), index=True)    
     __table_args__ = (
         Index("uq_webhookjob_invoice_id", "invoice_id", unique=True, postgresql_where=(invoice_id.isnot(None))),
-    )
-
-class PaymentWebhookEvent(Base):
+    )class PaymentWebhookEvent(Base):
     __tablename__ = "payment_webhook_events"
     invoice_id = Column(String, primary_key=True)
     client_ref = Column(String, index=True, nullable=True)
     payload = Column(Text, nullable=False)
-    received_at = Column(DateTime, default=func.now(), index=True)
-
-class UserLock(Base):
+    received_at = Column(DateTime, default=func.now(), index=True)class UserLock(Base):
     __tablename__ = "user_locks"
-    uid = Column(BigInteger, primary_key=True)
-
-# [MODULE 03 - DB_MODELS] v1.1.35
+    uid = Column(BigInteger, primary_key=True)# [MODULE 03 - DB_MODELS] v1.1.35
 if __name__!= "__main__":
-    print("[MODULE 03 - DB_MODELS] Loaded v1.1.35")
-
-
-
-# [MODULE 04 - LOGGER_UTILS]
+    print("[MODULE 03 - DB_MODELS] Loaded v1.1.35")# [MODULE 04 - LOGGER_UTILS]
 import logging
 import asyncio
 import randomlogging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -249,9 +195,7 @@ async def retry_with_jitter(fn, *args, max_attempts=3, **kwargs): # FIX B1
             await asyncio.sleep((2**i) + random.uniform(0.1, 0.5))
     return None
 if __name__!= "__main__":
-    print("[MODULE 04 - LOGGER_UTILS] Loaded v1.0.3")
-
-# [MODULE 05 - STATE_MANAGER]
+    print("[MODULE 04 - LOGGER_UTILS] Loaded v1.0.3")# [MODULE 05 - STATE_MANAGER]
 from db.db import SessionLocal
 from db.models import User
 from sqlalchemy import select, funcasync def set_state(uid, state):
@@ -266,20 +210,15 @@ from sqlalchemy import select, funcasync def set_state(uid, state):
         # 2026-04-29 FIX #1: removed stray db.begin() block line causing syntax errorasync def get_state(uid):
     async with SessionLocal() as db:
         u = await db.get(User, uid)
-        return u.state if u else "gate1"
-# [MODULE 05 - STATE_MANAGER] v1.0.3
+        return u.state if u else "gate1"# [MODULE 05 - STATE_MANAGER] v1.0.3
 # 2026-04-29 FIX #1: bump version after syntax fix
 if __name__!= "__main__":
-    print("[MODULE 05 - STATE_MANAGER] Loaded v1.0.3")
-
-# [MODULE 06 - SCHEDULER]
+    print("[MODULE 05 - STATE_MANAGER] Loaded v1.0.3")# [MODULE 06 - SCHEDULER]
 import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import logginglog = logging.getLogger("vipbot")
 scheduler = AsyncIOScheduler()if __name__!= "__main__":
-    print("[MODULE 06 - SCHEDULER] Loaded v1.0.2")
-
-#[MODULE 07 - BOT_INIT]
+    print("[MODULE 06 - SCHEDULER] Loaded v1.0.2")#[MODULE 07 - BOT_INIT]
 from pyrogram import Client
 from config import API_ID, API_HASH, BOT_TOKEN, IS_PAID, TG_SEMAPHORE, TG_WORKERS, TG_SLEEP_THRESHOLD
 import asynciotg_semaphore = asyncio.Semaphore(TG_SEMAPHORE)app = Client(
@@ -292,9 +231,7 @@ import asynciotg_semaphore = asyncio.Semaphore(TG_SEMAPHORE)app = Client(
     max_concurrent=1000 if IS_PAID else 500
 )# [MODULE 07 - BOT_INIT] v1.0.8
 if __name__!= "__main__":
-    print("[MODULE 07 - BOT_INIT] Loaded v1.0.8") 
-
-#[MODULE 08 - CONSTANTS]
+    print("[MODULE 07 - BOT_INIT] Loaded v1.0.8") #[MODULE 08 - CONSTANTS]
 from sqlalchemy import select
 from db.db import SessionLocal
 from db.models import Setting
@@ -323,9 +260,7 @@ async def get_gif(menu):
         val = s.value if s else DEFAULT_GIF.get(menu, DEFAULT_GIF["main"])
         _GIF_CACHE[menu] = val
         return valif __name__!= "__main__":
-    print("[MODULE 08 - CONSTANTS] Loaded v1.0.3")
-
-# [MODULE 09 - TG_API_WRAPPER]
+    print("[MODULE 08 - CONSTANTS] Loaded v1.0.3")# [MODULE 09 - TG_API_WRAPPER]
 import asyncio
 from core.logger import safe_call
 from core.bot import app, tg_semaphore async def _safe_send(client, chat_id, text, **kwargs):async with tg_semaphore:
@@ -352,57 +287,44 @@ from core.bot import app, tg_semaphore async def _safe_send(client, chat_id, tex
         return await safe_call(client.approve_chat_join_request, chat_id, user_id) is not Noneasync def send_message(client, chat_id, text, **kwargs):
     """Public helper: use this instead of client.send_message directly"""
     return await _safe_send(client, chat_id, text, **kwargs)if __name__!= "__main__":
-    print("[MODULE 09 - TG_API_WRAPPER] Loaded v1.0.5")
-
-
-# [MODULE 10 - HEALTH]
+    print("[MODULE 09 - TG_API_WRAPPER] Loaded v1.0.5")# [MODULE 10 - HEALTH]
 import asyncio
 import time
 import logging
 from datetime import datetime, timezone
 from db.db import SessionLocal
 from db.models import User, Payment
-from sqlalchemy import select, func
-
-try:
+from sqlalchemy import select, functry:
     import psutil
 except ImportError:
-    psutil = None
-
-logger = logging.getLogger(__name__)
-start = time.time()
-
-async def get_health():
+    psutil = Nonelogger = logging.getLogger(__name__)
+start = time.time()async def get_health():
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     async with SessionLocal() as db:
         res = await db.execute(select(func.count(User.uid)).where(User.created >= today_start))
         new_users_today = res.scalar() or 0
         res = await db.execute(select(func.sum(Payment.amount_usd)).where(Payment.paid == True, Payment.created >= today_start))
-        revenue_today_usd = res.scalar() or 0
-
-    if psutil is None:
+        revenue_today_usd = res.scalar() or 0if psutil is None:
+    cpu = -1
+    mem_percent = -1
+else:
+    try:
+        loop = asyncio.get_running_loop()
+        cpu = await loop.run_in_executor(None, psutil.cpu_percent, None)
+        mem = await loop.run_in_executor(None, psutil.virtual_memory)
+        mem_percent = mem.percent
+    except Exception as e:
+        logger.warning("psutil health check failed: %s", e)
         cpu = -1
         mem_percent = -1
-    else:
-        try:
-            loop = asyncio.get_running_loop()
-            cpu = await loop.run_in_executor(None, psutil.cpu_percent, None)
-            mem = await loop.run_in_executor(None, psutil.virtual_memory)
-            mem_percent = mem.percent
-        except Exception as e:
-            logger.warning("psutil health check failed: %s", e)
-            cpu = -1
-            mem_percent = -1
 
-    return {
-        "uptime": int(time.time() - start),
-        "cpu": cpu,
-        "mem": mem_percent,
-        "new_users_today": new_users_today,
-        "revenue_today_usd": float(revenue_today_usd or 0)
-    }
-
-# PATCH 12: ping_self must never crash boot
+return {
+    "uptime": int(time.time() - start),
+    "cpu": cpu,
+    "mem": mem_percent,
+    "new_users_today": new_users_today,
+    "revenue_today_usd": float(revenue_today_usd or 0)
+}# PATCH 12: ping_self must never crash boot
 async def ping_self():
     try:
         from db.db import get_http
@@ -412,14 +334,8 @@ async def ping_self():
         await s.get("http://localhost:8080/health", timeout=aiohttp.ClientTimeout(total=WEBHOOK_TIMEOUT))
     except Exception as e:
         logger.debug("ping_self failed, ignored: %s", e)
-        return
-
-if __name__!= "__main__":
-    print("[MODULE 10 - HEALTH] Loaded v1.0.4")
-
-
-
-# [MODULE 11 - TOKENS_ECONOMY]
+        returnif __name__!= "__main__":
+    print("[MODULE 10 - HEALTH] Loaded v1.0.4")# [MODULE 11 - TOKENS_ECONOMY]
 from db.models import User, Payment, WebhookJob
 from sqlalchemy import update, select, insert, or_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -432,47 +348,33 @@ import logging
 import redis.asyncio as redis
 from db.db import SessionLocal
 from config import OCC_RETRIES
-from modules.config_loader import REDIS_HOST
-
-logger = logging.getLogger(__name__)
+from modules.config_loader import REDIS_HOSTlogger = logging.getLogger(__name__)
 _uid_locks: dict[int, asyncio.Lock] = {}
 _global_lock = asyncio.Lock()
-_redis_tok = None
-
-async def _get_redis_tok():
+_redis_tok = Noneasync def _get_redis_tok():
     global _redis_tok
     if _redis_tok is None:
         _redis_tok = redis.Redis(host=REDIS_HOST, decode_responses=True)
-    return _redis_tok
-
-async def _get_uid_lock(uid: int) -> asyncio.Lock:
+    return _redis_tokasync def _get_uid_lock(uid: int) -> asyncio.Lock:
     async with _global_lock:
         if uid not in _uid_locks:
             _uid_locks[uid] = asyncio.Lock()
-        return _uid_locks[uid]
-
-async def get_balance(uid):
+        return _uid_locks[uid]async def get_balance(uid):
     async with SessionLocal() as db:
         u = await db.get(User, uid)
         if not u:
             return 0
-        return u.tokens
-
-async def get_lifetime_balance(uid):
+        return u.tokensasync def get_lifetime_balance(uid):
     async with SessionLocal() as db:
         u = await db.get(User, uid)
         if not u:
             return 0
-        return u.tokens + u.lifetime_referral_tokens
-
-async def _job_is_stale(db: AsyncSession, job_id: int) -> bool:
+        return u.tokens + u.lifetime_referral_tokensasync def _job_is_stale(db: AsyncSession, job_id: int) -> bool:
     if job_id is None:
         return True
     res = await db.execute(select(WebhookJob.status).where(WebhookJob.id == job_id))
     status = res.scalar_one_or_none()
-    return status in (None, "done", "failed")
-
-async def _add_tokens_inner(uid, amount, payment_id: int = None, job_id: int = None, db: AsyncSession = None, reason: str = 'payment'):
+    return status in (None, "done", "failed")async def _add_tokens_inner(uid, amount, payment_id: int = None, job_id: int = None, db: AsyncSession = None, reason: str = 'payment'):
     now = datetime.now(timezone.utc)
     if payment_id is not None:
         if reason not in ['admin', 'recovery']:
@@ -510,9 +412,7 @@ async def _add_tokens_inner(uid, amount, payment_id: int = None, job_id: int = N
         result = await db.execute(stmt_finalize)
         if result.rowcount!= 1:
             return False
-    return True
-
-async def add_tokens(uid, amount, payment_id: int = None, job_id: int = None, db: AsyncSession = None, reason: str = 'payment'):
+    return Trueasync def add_tokens(uid, amount, payment_id: int = None, job_id: int = None, db: AsyncSession = None, reason: str = 'payment'):
     r = await _get_redis_tok()
     side_effect_key = f"vip:side:payment:{payment_id}" if payment_id else f"vip:side:admin:{uid}:{amount}"
     if payment_id is not None and db is None:
@@ -565,9 +465,7 @@ async def add_tokens(uid, amount, payment_id: int = None, job_id: int = None, db
         return success
     finally:
         if own_session:
-            await db.close()
-
-async def deduct_tokens(uid, amount, idempotency_key: str = None, db: AsyncSession = None):
+            await db.close()async def deduct_tokens(uid, amount, idempotency_key: str = None, db: AsyncSession = None):
     own_session = False
     if db is None:
         own_session = True
@@ -602,13 +500,8 @@ async def deduct_tokens(uid, amount, idempotency_key: str = None, db: AsyncSessi
         return False
     finally:
         if own_session:
-            await db.close()
-
-if __name__!= "__main__":
-    print("[MODULE 11 - TOKENS_ECONOMY] Loaded v1.0.63")
-
-
-#[MODULE 12 - GATEKEEPER]
+            await db.close()if __name__!= "__main__":
+    print("[MODULE 11 - TOKENS_ECONOMY] Loaded v1.0.63")#[MODULE 12 - GATEKEEPER]
 from pyrogram import filters
 from core.bot import app, tg_semaphore
 from db.db import SessionLocal
@@ -704,9 +597,7 @@ async def gate_check(client, m):
     if config.SYSTEM_LOCKED:
         await send_message(client, m.chat.id, "Bot is starting, please wait")
         returnuid = m.from_user.id
-passed_gate = await check_gate(client, uid)
-
-async with SessionLocal() as db:
+passed_gate = await check_gate(client, uid)async with SessionLocal() as db:
     async with db.begin():
         u = await db.get(User, uid)
         is_new = False
@@ -726,14 +617,10 @@ async with SessionLocal() as db:
                     ).values(referred_by=ref_id))
             except: pass
         if not passed_gate:
-            await _vanish_menus(client, uid, db=db)
-
-if not passed_gate:
+            await _vanish_menus(client, uid, db=db)if not passed_gate:
     gate_name = _GATE_CACHE["value"] if _GATE_CACHE["value"] else "required channel"
     await send_message(client, m.chat.id, f"You left {gate_name}. Join to continue")
-    return
-
-if m.text and m.text.startswith("/start"):
+    returnif m.text and m.text.startswith("/start"):
     async with SessionLocal() as db:
         await _vanish_menus(client, uid, db=db)
     balance = await get_balance(uid)
@@ -741,11 +628,7 @@ if m.text and m.text.startswith("/start"):
     caption = main_menu(balance)
     async with tg_semaphore:
         await client.send_photo(chat_id=m.chat.id, photo=photo, caption=caption)if __name__!= "__main__":
-    print("[MODULE 12 - GATEKEEPER] Loaded v1.1.10")
-
-
-
-# [MODULE 13 - PACKAGES]
+    print("[MODULE 12 - GATEKEEPER] Loaded v1.1.10")# [MODULE 13 - PACKAGES]
 from datetime import datetime, timedelta, timezone
 from db.models import User, Payment
 from db.db import SessionLocal
@@ -758,15 +641,9 @@ from modules.logger_utils import retry_with_jitter
 import asyncio
 import random
 import logging
-from modules.tokens import _get_uid_lock
-
-logger = logging.getLogger(__name__)
-
-def remove_from_expiring(uid):
+from modules.tokens import _get_uid_locklogger = logging.getLogger(__name__)def remove_from_expiring(uid):
     from modules.user_and_payment_lifecycle import EXPIRING_SOON_SET
-    EXPIRING_SOON_SET.discard(uid)
-
-async def can_buy(uid: int, db: AsyncSession = None):
+    EXPIRING_SOON_SET.discard(uid)async def can_buy(uid: int, db: AsyncSession = None):
     own_db = db is None
     if own_db:
         db = SessionLocal()
@@ -778,103 +655,89 @@ async def can_buy(uid: int, db: AsyncSession = None):
         return expired and no_active
     finally:
         if own_db:
-            await db.close()
-
-async def activate_package(uid, key, active_channel, db: AsyncSession = None):
+            await db.close()async def activate_package(uid, key, active_channel, db: AsyncSession = None):
     own_db = False
     if db is None:
         db = SessionLocal()
         own_db = True
     p = PACKAGES[key]
-    cost = p["cost"]
-
-    async def _activate_tx():
-        success = False
-        max_attempts = OCC_RETRIES
-        for attempt in range(max_attempts):
-            if attempt > 0:
-                await asyncio.sleep(random.uniform(0.03, 0.10))
-            try:
-                async with db.begin():
-                    await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
-                    res_pending = await db.execute(select(func.count()).select_from(Payment).where(Payment.uid == uid, Payment.state.in_(['awaiting_payment', 'open']), Payment.paid == False))
-                    pending_count = res_pending.scalar() or 0
-                    if pending_count > 0:
+    cost = p["cost"]async def _activate_tx():
+    success = False
+    max_attempts = OCC_RETRIES
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            await asyncio.sleep(random.uniform(0.03, 0.10))
+        try:
+            async with db.begin():
+                await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
+                res_pending = await db.execute(select(func.count()).select_from(Payment).where(Payment.uid == uid, Payment.state.in_(['awaiting_payment', 'open']), Payment.paid == False))
+                pending_count = res_pending.scalar() or 0
+                if pending_count > 0:
+                    success = False
+                    break
+                from modules.callbacks_payment import is_user_locked_for_buy
+                if await is_user_locked_for_buy(uid, db):
+                    success = False
+                    break
+                uid_lock = await _get_uid_lock(uid)
+                async with uid_lock:
+                    res_u = await db.execute(select(User).where(User.uid == uid).with_for_update())
+                    u = res_u.scalar_one_or_none()
+                    if not u:
                         success = False
                         break
-                    from modules.callbacks_payment import is_user_locked_for_buy
-                    if await is_user_locked_for_buy(uid, db):
+                    now = datetime.now(timezone.utc)
+                    for retry in range(OCC_RETRIES):
+                        if retry == OCC_RETRIES - 1:
+                            logger.warning("OCC contention: activate_package final retry attempt=%s for uid=%s key=%s", retry, uid, key)
+                        res_ver = await db.execute(select(User.balance_version, User.tokens).where(User.uid == uid).with_for_update())
+                        row = res_ver.first()
+                        if not row:
+                            success = False
+                            break
+                        expected_version, current_tokens = row
+                        if current_tokens < cost:
+                            success = False
+                            break
+                        stmt = (
+                            update(User)
+                       .where(User.uid == uid, User.tokens >= cost, User.active_channel.is_(None), User.balance_version == expected_version)
+                       .values(tokens=User.tokens - cost, balance_version=User.balance_version + 1, active_package=key, active_channel=active_channel, package_end=now + timedelta(seconds=p["internal"]))
+                        )
+                        res = await db.execute(stmt)
+                        if res.rowcount == 1:
+                            success = True
+                            break
+                        await asyncio.sleep(random.uniform(0.015 * (2 ** retry), 0.045 * (2 ** retry)))
+                    else:
                         success = False
+                    if not success:
                         break
-                    uid_lock = await _get_uid_lock(uid)
-                    async with uid_lock:
-                        res_u = await db.execute(select(User).where(User.uid == uid).with_for_update())
-                        u = res_u.scalar_one_or_none()
-                        if not u:
-                            success = False
-                            break
-                        now = datetime.now(timezone.utc)
-                        for retry in range(OCC_RETRIES):
-                            if retry == OCC_RETRIES - 1:
-                                logger.warning("OCC contention: activate_package final retry attempt=%s for uid=%s key=%s", retry, uid, key)
-                            res_ver = await db.execute(select(User.balance_version, User.tokens).where(User.uid == uid).with_for_update())
-                            row = res_ver.first()
-                            if not row:
-                                success = False
-                                break
-                            expected_version, current_tokens = row
-                            if current_tokens < cost:
-                                success = False
-                                break
-                            stmt = (
-                                update(User)
-                           .where(User.uid == uid, User.tokens >= cost, User.active_channel.is_(None), User.balance_version == expected_version)
-                           .values(tokens=User.tokens - cost, balance_version=User.balance_version + 1, active_package=key, active_channel=active_channel, package_end=now + timedelta(seconds=p["internal"]))
-                            )
-                            res = await db.execute(stmt)
-                            if res.rowcount == 1:
-                                success = True
-                                break
-                            await asyncio.sleep(random.uniform(0.015 * (2 ** retry), 0.045 * (2 ** retry)))
-                        else:
-                            success = False
-                        if not success:
-                            break
-                if success:
-                    await add_expiring_user(uid, db)
-                return success
-            except DBAPIError as e:
-                if attempt < max_attempts - 1 and getattr(e.orig, 'pgcode', None) == '40001':
-                    await asyncio.sleep(random.uniform(0.02, 0.08))
-                    continue
-                if attempt < max_attempts - 1:
-                    await asyncio.sleep(random.uniform(0.02, 0.08))
-                    continue
-                raise
-        return False
+            if success:
+                await add_expiring_user(uid, db)
+            return success
+        except DBAPIError as e:
+            if attempt < max_attempts - 1 and getattr(e.orig, 'pgcode', None) == '40001':
+                await asyncio.sleep(random.uniform(0.02, 0.08))
+                continue
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(random.uniform(0.02, 0.08))
+                continue
+            raise
+    return False
 
-    try:
-        return await retry_with_jitter(_activate_tx)
-    finally:
-        if own_db:
-            await db.close()
-
-async def repopulate_expiring_set(db: AsyncSession):
+try:
+    return await retry_with_jitter(_activate_tx)
+finally:
+    if own_db:
+        await db.close()async def repopulate_expiring_set(db: AsyncSession):
     now = datetime.now(timezone.utc)
     stmt = select(User.uid).where(User.package_end.isnot(None), User.active_channel.isnot(None), User.package_end > now)
     res = await db.execute(stmt)
     for (uid,) in res.fetchall():
-        await add_expiring_user(uid, db=db)
-
-async def sanitize_negative_balances(db: AsyncSession):
-    await db.execute(update(User).where(User.tokens < 0).values(tokens=0))
-
-if __name__!= "__main__":
-    print("[MODULE 13 - PACKAGES] Loaded v1.0.38")
-
-
-
-# [MODULE 14 - PREMIUM_UTILS]
+        await add_expiring_user(uid, db=db)async def sanitize_negative_balances(db: AsyncSession):
+    await db.execute(update(User).where(User.tokens < 0).values(tokens=0))if __name__!= "__main__":
+    print("[MODULE 13 - PACKAGES] Loaded v1.0.38")# [MODULE 14 - PREMIUM_UTILS]
 from sqlalchemy import select
 from db.db import SessionLocal
 from db.models import Setting
@@ -908,12 +771,9 @@ CACHE_TTL = 1800 async def _clear_cache_job():
         except:
             pass 
     global _PREMIUM_CACHE
-    _PREMIUM_CACHE = resolved
-
-    res = await db.execute(select(Setting).where(Setting.key.like("invite_%")))
-    global _INVITE_CACHE
-    _INVITE_CACHE = {s.key.replace("invite_", ""): s.value for s in res.scalars()}
-_CACHE_TS["premium"] = _CACHE_TS["invite"] = time.time()async def set_premium(channels):
+    _PREMIUM_CACHE = resolvedres = await db.execute(select(Setting).where(Setting.key.like("invite_%")))
+global _INVITE_CACHE
+_INVITE_CACHE = {s.key.replace("invite_", ""): s.value for s in res.scalars()}_CACHE_TS["premium"] = _CACHE_TS["invite"] = time.time()async def set_premium(channels):
     from core.bot import app, tg_semaphore
     resolved = []   
     for ch in channels:
@@ -944,10 +804,7 @@ async def get_invite_link(channel_id):
     if time.time() - _CACHE_TS["invite"] > CACHE_TTL:
         await load_premium_cache()
     return _INVITE_CACHE.get(str(channel_id))if __name__!= "__main__":
-    print("[MODULE 14 - PREMIUM_UTILS] Loaded v1.0.8")
-
-
-# [MODULE 15 - INVITES]
+    print("[MODULE 14 - PREMIUM_UTILS] Loaded v1.0.8")# [MODULE 15 - INVITES]
 from datetime import datetime, timezone
 from pyrogram import filters
 from core.bot import app, tg_semaphore
@@ -960,20 +817,14 @@ from modules.tg_api import send_message
 from config import REFERRAL_CHANNEL
 import config
 import time
-from sqlalchemy import update, select, delete
-
-_REFERRAL_CACHE = {"value": None, "ts": 0}
-CACHE_TTL_REFERRAL = 1800
-
-async def load_referral_cache():
+from sqlalchemy import update, select, delete_REFERRAL_CACHE = {"value": None, "ts": 0}
+CACHE_TTL_REFERRAL = 1800async def load_referral_cache():
     async with SessionLocal() as db:
         s = await db.get(Setting, "referral_channel")
         raw = s.value if s and s.value else REFERRAL_CHANNEL
     numeric_id = await _parse_channel_id(app, raw)
     global _REFERRAL_CACHE
-    _REFERRAL_CACHE = {"value": numeric_id, "ts": time.time()}
-
-async def _parse_channel_id(client, raw):
+    _REFERRAL_CACHE = {"value": numeric_id, "ts": time.time()}async def _parse_channel_id(client, raw):
     if not raw:
         return None
     if isinstance(raw, int):
@@ -989,25 +840,19 @@ async def _parse_channel_id(client, raw):
                 await db.merge(Setting(key="referral_channel", value=str(numeric_id)))
         return numeric_id
     except:
-        return None
-
-async def get_referral_channel(client):
+        return Noneasync def get_referral_channel(client):
     global _REFERRAL_CACHE
     now = time.time()
     if _REFERRAL_CACHE["value"] is None or (now - _REFERRAL_CACHE["ts"] > CACHE_TTL_REFERRAL):
         await load_referral_cache()
-    return _REFERRAL_CACHE["value"]
-
-async def send_invite(client, uid, channel):
+    return _REFERRAL_CACHE["value"]async def send_invite(client, uid, channel):
     link = await get_invite_link(channel)
     if not link:
         async with tg_semaphore:
             invite = await client.create_chat_invite_link(channel, creates_join_request=True)
         link = invite.invite_link
         await set_invite_link(channel, link)
-    await send_message(client, uid, f"Join here: {link}")
-
-@app.on_chat_join_request()
+    await send_message(client, uid, f"Join here: {link}")@app.on_chat_join_request()
 async def handle_join_request(client, join_req):
     if config.SYSTEM_LOCKED:
         return
@@ -1030,9 +875,7 @@ async def handle_join_request(client, join_req):
                 await client.approve_chat_join_request(chat_id, user_id)
         else:
             async with tg_semaphore:
-                await client.decline_chat_join_request(chat_id, user_id)
-
-async def get_ref_owner_from_link(link: str, db: AsyncSession):
+                await client.decline_chat_join_request(chat_id, user_id)async def get_ref_owner_from_link(link: str, db: AsyncSession):
     s = await db.get(Setting, f"ref_invite_{link}")
     if not s:
         return None
@@ -1044,9 +887,7 @@ async def get_ref_owner_from_link(link: str, db: AsyncSession):
             return None
         return int(owner_str)
     except:
-        return None
-
-@app.on_chat_member()
+        return None@app.on_chat_member()
 async def on_join_complete(client, update):
     if config.SYSTEM_LOCKED:
         return
@@ -1096,13 +937,8 @@ async def on_join_complete(client, update):
         except:
             pass
     if should_kick:
-        await kick_with_fallback(client, chat_id, user_id)
-
-if __name__!= "__main__":
-    print("[MODULE 15 - INVITES] Loaded v1.0.22")
-
-
-# [MODULE 16 - REFERRAL_SYSTEM]
+        await kick_with_fallback(client, chat_id, user_id)if __name__!= "__main__":
+    print("[MODULE 15 - INVITES] Loaded v1.0.22")# [MODULE 16 - REFERRAL_SYSTEM]
 import uuid
 import asyncio
 import time
@@ -1117,27 +953,21 @@ from db.models import User, Setting
 from sqlalchemy import update, select, delete
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
-from modules.tokens import _get_uid_lock
-
-logger = logging.getLogger(__name__)
+from modules.tokens import _get_uid_locklogger = logging.getLogger(__name__)
 ref_links = {}
 _REF_LINK_CACHE = {}
 _REFERRAL_CHANNEL_CACHE = {"value": None, "ts": 0}
 CACHE_TTL_REFERRAL = 1800
 _REF_CONFIG_CACHE = {"daily_cap": None, "reward": None, "ts": 0}
 CACHE_TTL_CONFIG = 300
-_RECOVERY_DONE = False
-
-async def _get_ref_config():
+_RECOVERY_DONE = Falseasync def _get_ref_config():
     now = time.time()
     if _REF_CONFIG_CACHE["daily_cap"] is not None and (now - _REF_CONFIG_CACHE["ts"] < CACHE_TTL_CONFIG):
         return _REF_CONFIG_CACHE["daily_cap"], _REF_CONFIG_CACHE["reward"]
     daily_cap = DAILY_REF_CAP
     reward = REFERRAL_REWARD
     _REF_CONFIG_CACHE.update({"daily_cap": daily_cap, "reward": reward, "ts": now})
-    return daily_cap, reward
-
-async def _do_recovery():
+    return daily_cap, rewardasync def _do_recovery():
     global _RECOVERY_DONE
     if _RECOVERY_DONE:
         return
@@ -1164,9 +994,7 @@ async def _do_recovery():
     numeric_id = await _parse_channel_id(app, raw)
     global _REFERRAL_CHANNEL_CACHE
     _REFERRAL_CHANNEL_CACHE = {"value": numeric_id, "ts": time.time()}
-    _RECOVERY_DONE = True
-
-async def _parse_channel_id(client, raw):
+    _RECOVERY_DONE = Trueasync def _parse_channel_id(client, raw):
     if not raw:
         return None
     if isinstance(raw, int):
@@ -1187,9 +1015,7 @@ async def _parse_channel_id(client, raw):
         _REFERRAL_CHANNEL_CACHE = {"value": numeric_id, "ts": now}
         return numeric_id
     except:
-        return None
-
-async def gen_link(client, uid):
+        return Noneasync def gen_link(client, uid):
     cached = _REF_LINK_CACHE.get(uid)
     if cached and cached["expires"] > datetime.now(timezone.utc):
         return cached["link"]
@@ -1211,9 +1037,7 @@ async def gen_link(client, uid):
             await db.merge(Setting(key=f"ref_cache_{uid}", value=f"{link}|{cache_expires.isoformat()}"))
     ref_links[code] = {"owner": uid, "expires": expires, "channel": channel_id}
     _REF_LINK_CACHE[uid] = {"link": link, "expires": cache_expires}
-    return link
-
-async def credit_referral(owner_id, new_user_id, db=None):
+    return linkasync def credit_referral(owner_id, new_user_id, db=None):
     daily_cap, reward = await _get_ref_config()
     own_db = False
     if db is None:
@@ -1263,9 +1087,7 @@ async def credit_referral(owner_id, new_user_id, db=None):
         return False
     finally:
         if own_db:
-            await db.close()
-
-async def ref_maintenance_loop():
+            await db.close()async def ref_maintenance_loop():
     await _do_recovery()
     while True:
         now = datetime.now(timezone.utc)
@@ -1294,9 +1116,7 @@ async def ref_maintenance_loop():
                         pass
                 for key in to_delete:
                     await db.execute(delete(Setting).where(Setting.key==key))
-        await asyncio.sleep(300)
-
-async def get_ref_owner_from_link(link: str, db: AsyncSession):
+        await asyncio.sleep(300)async def get_ref_owner_from_link(link: str, db: AsyncSession):
     s = await db.get(Setting, f"ref_invite_{link}")
     if not s:
         return None
@@ -1308,13 +1128,8 @@ async def get_ref_owner_from_link(link: str, db: AsyncSession):
             return None
         return int(owner_str)
     except:
-        return None
-
-if __name__!= "__main__":
-    print("[MODULE 16 - REFERRAL_SYSTEM] Loaded v1.2.12")
-
-
-# [MODULE 17A - ALBY_CLIENT]
+        return Noneif __name__!= "__main__":
+    print("[MODULE 16 - REFERRAL_SYSTEM] Loaded v1.2.12")# [MODULE 17A - ALBY_CLIENT]
 import asyncio
 import random
 import time
@@ -1324,11 +1139,7 @@ from config import ALBY_TOKEN
 from modules.config_loader import ALBY_RPS
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import text, update, func
-from db.models import Payment
-
-alby_semaphore = asyncio.Semaphore(ALBY_RPS)
-
-async def alby_is_paid(invoice_id: str) -> bool | None:
+from db.models import Paymentalby_semaphore = asyncio.Semaphore(ALBY_RPS)async def alby_is_paid(invoice_id: str) -> bool | None:
     if not invoice_id:
         return None
     s = await get_http()
@@ -1345,9 +1156,7 @@ async def alby_is_paid(invoice_id: str) -> bool | None:
             return True
         return False
     except Exception:
-        return None
-
-async def alby_is_paid_by_ref(client_ref: str) -> dict | None:
+        return Noneasync def alby_is_paid_by_ref(client_ref: str) -> dict | None:
     if not client_ref:
         return None
     s = await get_http()
@@ -1361,9 +1170,7 @@ async def alby_is_paid_by_ref(client_ref: str) -> dict | None:
             return None
         return await r.json()
     except Exception:
-        return None
-
-async def _reconcile_orphaned_invoices(db=None):
+        return Noneasync def _reconcile_orphaned_invoices(db=None):
     own_db = False
     if db is None:
         db = SessionLocal()
@@ -1381,9 +1188,7 @@ async def _reconcile_orphaned_invoices(db=None):
                 await db.commit()
     finally:
         if own_db:
-            await db.close()
-
-async def reconcile_reserving_payments(db=None):
+            await db.close()async def reconcile_reserving_payments(db=None):
     from config import RESERVING_TIMEOUT_SEC
     own_db = False
     if db is None:
@@ -1402,14 +1207,8 @@ async def reconcile_reserving_payments(db=None):
                 await db.commit()
     finally:
         if own_db:
-            await db.close()
-
-if __name__!= "__main__":
-    print("[MODULE 17A - ALBY_CLIENT] Loaded v1.0.48")
-
-
-
-# [MODULE 17B - PAYMENTS_API]
+            await db.close()if __name__!= "__main__":
+    print("[MODULE 17A - ALBY_CLIENT] Loaded v1.0.48")# [MODULE 17B - PAYMENTS_API]
 import asyncio
 import time
 import os
@@ -1420,14 +1219,10 @@ from config import ALBY_TOKEN
 from modules.config_loader import IS_PAID, ALBY_RPS
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import update, select, text, and_, delete, insert, or_, func
-from sqlalchemy.exc import IntegrityError
-
-_PENDING_MAP_FILE = "/tmp/alby_pending_map.json"
+from sqlalchemy.exc import IntegrityError_PENDING_MAP_FILE = "/tmp/alby_pending_map.json"
 _PRICE_CACHE = {"price": None, "tokens": None, "ts": 0}
 CACHE_TTL_PRICE = 300
-alby_semaphore = asyncio.Semaphore(ALBY_RPS)
-
-async def _get_price_config():
+alby_semaphore = asyncio.Semaphore(ALBY_RPS)async def _get_price_config():
     now = time.time()
     if _PRICE_CACHE["price"] is not None and (now - _PRICE_CACHE["ts"] < CACHE_TTL_PRICE):
         return _PRICE_CACHE["price"], _PRICE_CACHE["tokens"]
@@ -1439,9 +1234,7 @@ async def _get_price_config():
     _PRICE_CACHE["price"] = price
     _PRICE_CACHE["tokens"] = tokens
     _PRICE_CACHE["ts"] = now
-    return price, tokens
-
-async def create_invoice(uid: int) -> tuple[str, str, int, float, int]:
+    return price, tokensasync def create_invoice(uid: int) -> tuple[str, str, int, float, int]:
     price_usd, tokens_per_usd = await _get_price_config()
     amount_usd = price_usd
     client_ref = str(uuid.uuid4())
@@ -1479,16 +1272,10 @@ async def create_invoice(uid: int) -> tuple[str, str, int, float, int]:
                 if row and row.invoice_id and row.payment_request:
                     return (row.payment_request, row.invoice_id, pay_id, amount_usd, tokens_per_usd)
                 raise RuntimeError("Failed to attach Alby invoice to payment row")
-    return (data["payment_request"], data["id"], pay_id, amount_usd, tokens_per_usd)
-
-if __name__!= "__main__":
-    print("[MODULE 17B - PAYMENTS_API] Loaded v1.1.2")
-
-# [MODULE 18 - KICK]
+    return (data["payment_request"], data["id"], pay_id, amount_usd, tokens_per_usd)if __name__!= "__main__":
+    print("[MODULE 17B - PAYMENTS_API] Loaded v1.1.2")# [MODULE 18 - KICK]
 from core.bot import tg_semaphore
-from config import ADMIN_IDS
-
-async def kick_with_fallback(client, chat_id, uid):
+from config import ADMIN_IDSasync def kick_with_fallback(client, chat_id, uid):
     if uid in ADMIN_IDS:
         return False
     try:
@@ -1507,13 +1294,8 @@ async def kick_with_fallback(client, chat_id, uid):
         member = await safe_call(client.get_chat_member, chat_id, uid)
     if member and member.status in ["left", "kicked"]:
         return True
-    return False
-
-if __name__!= "__main__":
-    print("[MODULE 18 - KICK] Loaded v1.0.5")
-
-
-# [MODULE 19 - ADMIN_COMMANDS]
+    return Falseif __name__!= "__main__":
+    print("[MODULE 18 - KICK] Loaded v1.0.5")# [MODULE 19 - ADMIN_COMMANDS]
 import asyncio
 from datetime import datetime, timezone
 from pyrogram import filters
@@ -1528,17 +1310,13 @@ from modules.constants import load_gif_cache
 from modules.premium import load_premium_cache
 from modules.invites import load_referral_cache
 from config import ADMIN_IDS
-from sqlalchemy import select, func
-
-async def _safe_send(client, uid, msg):
+from sqlalchemy import select, funcasync def _safe_send(client, uid, msg):
     try:
         async with tg_semaphore:
             await client.send_message(uid, msg)
         await asyncio.sleep(0.05)
     except:
-        pass
-
-async def _parse_channel_id(client, raw):
+        passasync def _parse_channel_id(client, raw):
     if not raw:
         return None
     if str(raw).startswith("-100"):
@@ -1548,18 +1326,14 @@ async def _parse_channel_id(client, raw):
             chat = await client.get_chat(raw)
         return chat.id
     except:
-        return None
-
-@app.on_message(filters.command("add") & filters.user(ADMIN_IDS))
+        return None@app.on_message(filters.command("add") & filters.user(ADMIN_IDS))
 async def add_token_cmd(_, m: Message):
     try:
         _, uid, amt = m.text.split()
         await add_tokens(int(uid), int(amt), reason='admin')
         await _safe_send(_, m.chat.id, "Tokens added")
     except:
-        await _safe_send(_, m.chat.id, "Usage: /add <uid> <amt>")
-
-@app.on_message(filters.command("admin_finalize") & filters.user(ADMIN_IDS))
+        await _safe_send(_, m.chat.id, "Usage: /add <uid> <amt>")@app.on_message(filters.command("admin_finalize") & filters.user(ADMIN_IDS))
 async def admin_finalize_cmd(_, m: Message):
     try:
         _, payment_id = m.text.split()
@@ -1577,9 +1351,7 @@ async def admin_finalize_cmd(_, m: Message):
     if ok:
         await _safe_send(_, m.chat.id, f"Payment {payment_id} finalized")
     else:
-        await _safe_send(_, m.chat.id, f"Failed to finalize {payment_id}")
-
-@app.on_message(filters.command("earnings") & filters.user(ADMIN_IDS))
+        await _safe_send(_, m.chat.id, f"Failed to finalize {payment_id}")@app.on_message(filters.command("earnings") & filters.user(ADMIN_IDS))
 async def earnings(_, m: Message):
     today = datetime.now(timezone.utc).date()
     async with SessionLocal() as db:
@@ -1588,9 +1360,7 @@ async def earnings(_, m: Message):
             new_users = res.scalar() or 0
             res = await db.execute(select(func.sum(Payment.amount_usd)).where(Payment.paid==True, func.date(Payment.created) == today))
             revenue = res.scalar() or 0
-    await _safe_send(_, m.chat.id, f"Today: {new_users} new users\nRevenue: ${revenue:.2f}")
-
-@app.on_message(filters.command("post") & filters.user(ADMIN_IDS))
+    await _safe_send(_, m.chat.id, f"Today: {new_users} new users\nRevenue: ${revenue:.2f}")@app.on_message(filters.command("post") & filters.user(ADMIN_IDS))
 async def post_cmd(client, m: Message):
     parts = m.text.split(" ", 2)
     if len(parts) == 1:
@@ -1618,9 +1388,7 @@ async def post_cmd(client, m: Message):
         count += 1
         if count % 20 == 0:
             await asyncio.sleep(0.1)
-    await _safe_send(client, m.chat.id, f"Posted to {count} users")
-
-@app.on_message(filters.command("setgif") & filters.user(ADMIN_IDS))
+    await _safe_send(client, m.chat.id, f"Posted to {count} users")@app.on_message(filters.command("setgif") & filters.user(ADMIN_IDS))
 async def set_gif_cmd(_, m: Message):
     try:
         _, menu = m.text.split()
@@ -1635,9 +1403,7 @@ async def set_gif_cmd(_, m: Message):
         async with db.begin():
             await db.merge(Setting(key=f"gif_{menu}", value=gif_id))
     await load_gif_cache()
-    await _safe_send(_, m.chat.id, f"GIF for '{menu}' set")
-
-@app.on_message(filters.command("defaults") & filters.user(ADMIN_IDS))
+    await _safe_send(_, m.chat.id, f"GIF for '{menu}' set")@app.on_message(filters.command("defaults") & filters.user(ADMIN_IDS))
 async def defaults_cmd(_, m: Message):
     parts = m.text.split()
     key = None
@@ -1677,9 +1443,7 @@ async def defaults_cmd(_, m: Message):
     if key and val:
         await _safe_send(_, m.chat.id, f"Default {key} set to {val}")
     else:
-        await _safe_send(_, m.chat.id, "Usage: /defaults\nOr: /defaults <key> <value>\nKeys: price_usd, tokens_per_usd, new_user_tokens, premium_channels, referral_channel, gif_<menu>")
-
-@app.on_message(filters.command("setpremium") & filters.user(ADMIN_IDS))
+        await _safe_send(_, m.chat.id, "Usage: /defaults\nOr: /defaults <key> <value>\nKeys: price_usd, tokens_per_usd, new_user_tokens, premium_channels, referral_channel, gif_<menu>")@app.on_message(filters.command("setpremium") & filters.user(ADMIN_IDS))
 async def set_premium_cmd(_, m: Message):
     try:
         _, channels_raw = m.text.split(" ", 1)
@@ -1693,14 +1457,10 @@ async def set_premium_cmd(_, m: Message):
         await load_premium_cache()
         await _safe_send(_, m.chat.id, f"Premium channels set: {','.join(channels)}")
     except:
-        await _safe_send(_, m.chat.id, "Usage: /setpremium <channel_id1,channel_id2>\nExample: /setpremium -100123,-100456\nMax 2 channels")
-
-@app.on_message(filters.command("health") & filters.user(ADMIN_IDS))
+        await _safe_send(_, m.chat.id, "Usage: /setpremium <channel_id1,channel_id2>\nExample: /setpremium -100123,-100456\nMax 2 channels")@app.on_message(filters.command("health") & filters.user(ADMIN_IDS))
 async def health_cmd(_, m):
     h = await get_health()
-    await _safe_send(_, m.chat.id, f"Uptime: {h['uptime']}s\nCPU: {h['cpu']}%\nMEM: {h['mem']}%\nNew: {h['new_users_today']}\nRev: ${h['revenue_today_usd']}")
-
-@app.on_message(filters.command("setreferral") & filters.user(ADMIN_IDS))
+    await _safe_send(_, m.chat.id, f"Uptime: {h['uptime']}s\nCPU: {h['cpu']}%\nMEM: {h['mem']}%\nNew: {h['new_users_today']}\nRev: ${h['revenue_today_usd']}")@app.on_message(filters.command("setreferral") & filters.user(ADMIN_IDS))
 async def set_referral(client, m):
     try:
         _, channel_raw = m.text.split()
@@ -1714,15 +1474,8 @@ async def set_referral(client, m):
         await load_referral_cache()
         await _safe_send(client, m.chat.id, f"Referral channel set: {channel_id}")
     except:
-        await _safe_send(client, m.chat.id, "Usage: /setreferral <channel_id>\nExample: /setreferral -100123 or @channel or t.me/+abc")
-
-if __name__!= "__main__":
-    print("[MODULE 19 - ADMIN_COMMANDS] Loaded v1.1.13")
-
-
-
-
-[MODULE 20 - UI_MENUS]
+        await _safe_send(client, m.chat.id, "Usage: /setreferral <channel_id>\nExample: /setreferral -100123 or @channel or t.me/+abc")if __name__!= "__main__":
+    print("[MODULE 19 - ADMIN_COMMANDS] Loaded v1.1.13")[MODULE 20 - UI_MENUS]
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from modules.premium import get_invite_link 
 def main_menu(balance):
@@ -1769,15 +1522,9 @@ def buy_menu(invoice=""):
         [InlineKeyboardButton(" Go Back", callback_data="main")]
     ])def stats_menu():
     return InlineKeyboardMarkup([[InlineKeyboardButton(" Back", callback_data="referral")]])if name!= "main":
-    print("[MODULE 20 - UI_MENUS] Loaded v1.0.7")
-
-
-# [MODULE 21 - TEMPLATES]
+    print("[MODULE 20 - UI_MENUS] Loaded v1.0.7")# [MODULE 21 - TEMPLATES]
 PAYMENT_WARNING = "The payment method used is for their anonymity and privacy, and the bot has no idea of sender details."if __name__!= "__main__":
-    print("[MODULE 21 - TEMPLATES] Loaded v1.0.2")
-
-
-# [MODULE 22 - ENTRY]
+    print("[MODULE 21 - TEMPLATES] Loaded v1.0.2")# [MODULE 22 - ENTRY]
 import asyncio
 import os
 from datetime import datetime, timezone, timedelta
@@ -1802,22 +1549,16 @@ import redis.asyncio as redis
 import config
 from config import ADMIN_IDS
 from sqlalchemy import update, select, delete, text, func
-from modules.config_loader import IS_PAID, CLOUDFLARE_PING_SEC, WEBHOOK_TIMEOUT, REDIS_HOST, BOOT_LOCK_KEY, RECOVERY_MAX_RUNTIME_SEC, RESERVING_TIMEOUT_SEC
-
-async def init_db():
+from modules.config_loader import IS_PAID, CLOUDFLARE_PING_SEC, WEBHOOK_TIMEOUT, REDIS_HOST, BOOT_LOCK_KEY, RECOVERY_MAX_RUNTIME_SEC, RESERVING_TIMEOUT_SECasync def init_db():
     async with async_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-async def ping_self():
+        await conn.run_sync(Base.metadata.create_all)async def ping_self():
     try:
         s = await get_http()
         await s.get("http://localhost:8080/health", timeout=aiohttp.ClientTimeout(total=WEBHOOK_TIMEOUT))
     except Exception as e:
         import logging
         logging.getLogger(__name__).debug("ping_self ignored: %s", e)
-        pass
-
-async def main():
+        passasync def main():
     config.SYSTEM_LOCKED = True
     await init_db()
     await load_gif_cache()
@@ -1846,14 +1587,9 @@ async def main():
     finally:
         await close_http()
         from modules.callbacks_ui import close_redis_cb
-        await close_redis_cb()
-
-asyncio.run(main())
+        await close_redis_cb()asyncio.run(main())
 if __name__!= "__main__":
-    print("[MODULE 22 - ENTRY] Loaded v1.1.39")
-
-
-# [MODULE 23 - WEBHOOK_SERVER]
+    print("[MODULE 22 - ENTRY] Loaded v1.1.39")# [MODULE 23 - WEBHOOK_SERVER]
 import json
 import hmac
 import hashlib
@@ -1874,28 +1610,18 @@ import logging
 import time
 from modules.config_loader import IS_PAID, WEBHOOK_TIMEOUT, WEBHOOK_NOTIFY_PARALLEL, TOKENS_PER_USD
 from config import WEBHOOK_SECRET
-import config
-
-log = logging.getLogger(__name__)
+import configlog = logging.getLogger(__name__)
 WEBHOOK_SECRET_ENV = os.getenv("ALBY_WEBHOOK_SECRET")
 IDEMPOTENCY_TTL = 86400
 _NOTIFY_SEMAPHORE = asyncio.Semaphore(WEBHOOK_NOTIFY_PARALLEL)
-_redis = None
-
-async def _get_redis():
+_redis = Noneasync def _get_redis():
     global _redis
     if _redis is None:
         import redis.asyncio as redis
         _redis = redis.Redis(host=os.getenv("REDIS_HOST", "redis"), port=6379, decode_responses=True)
-    return _redis
-
-async def _reset_stuck_jobs(db):
-    pass
-
-async def _cleanup_old_jobs(db):
-    pass
-
-async def _send_notify_messages(uid, tokens_to_credit):
+    return _redisasync def _reset_stuck_jobs(db):
+    passasync def _cleanup_old_jobs(db):
+    passasync def _send_notify_messages(uid, tokens_to_credit):
     async with SessionLocal() as db:
         res = await db.execute(select(Payment.tokens_credited).where(Payment.uid == uid, Payment.tokens_credited == True).order_by(Payment.credited_at.desc()).limit(1))
         if not res.scalar():
@@ -1904,12 +1630,8 @@ async def _send_notify_messages(uid, tokens_to_credit):
     async with tg_semaphore:
         await app.send_message(uid, f" Deposit successful!\n+{tokens_to_credit} tokens credited.\nNew Balance: {new_bal}\n\n{PAYMENT_WARNING}")
     async with tg_semaphore:
-        await app.send_animation(uid, animation=await get_gif("packages"), caption="Select your access duration:", reply_markup=packages_menu())
-
-async def notify_user(uid, tokens_to_credit, db):
-    await set_state(uid, "packages", db=db)
-
-async def alby_webhook(request):
+        await app.send_animation(uid, animation=await get_gif("packages"), caption="Select your access duration:", reply_markup=packages_menu())async def notify_user(uid, tokens_to_credit, db):
+    await set_state(uid, "packages", db=db)async def alby_webhook(request):
     if config.SYSTEM_LOCKED:
         return web.Response(status=503, text="Bot is starting, please wait")
     secret = WEBHOOK_SECRET or WEBHOOK_SECRET_ENV
@@ -1938,72 +1660,68 @@ async def alby_webhook(request):
     except Exception:
         amount_usd = 0.0
     client_ref = (invoice_data.get("metadata") or {}).get("client_ref")
-    tokens_to_credit = int(round(amount_usd * TOKENS_PER_USD)) if amount_usd else 0
-
-    async with SessionLocal() as db:
+    tokens_to_credit = int(round(amount_usd * TOKENS_PER_USD)) if amount_usd else 0async with SessionLocal() as db:
+    try:
+        async with db.begin():
+            await db.execute(text("""
+                INSERT INTO payment_webhook_events (invoice_id, client_ref, payload, received_at)
+                VALUES (:inv, :ref, :payload, :ts)
+                ON CONFLICT (invoice_id) DO NOTHING
+            """), {"inv": invoice_id, "ref": client_ref, "payload": json.dumps(data), "ts": datetime.now(timezone.utc)})
+    except Exception as e:
+        log.error("audit insert failed: %s", e)
         try:
-            async with db.begin():
-                await db.execute(text("""
-                    INSERT INTO payment_webhook_events (invoice_id, client_ref, payload, received_at)
-                    VALUES (:inv, :ref, :payload, :ts)
-                    ON CONFLICT (invoice_id) DO NOTHING
-                """), {"inv": invoice_id, "ref": client_ref, "payload": json.dumps(data), "ts": datetime.now(timezone.utc)})
-        except Exception as e:
-            log.error("audit insert failed: %s", e)
-            try:
-                await db.rollback()
-            except Exception:
-                pass
-            raise
+            await db.rollback()
+        except Exception:
+            pass
+        raise
 
-        payment_id_for_redis = None
-        uid_for_notify = None
-        try:
-            async with db.begin():
-                await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
-                stmt = select(Payment).where(or_(Payment.invoice_id == invoice_id, Payment.client_ref == client_ref)).with_for_update()
-                res = await db.execute(stmt)
-                payment = res.scalar_one_or_none()
-                if not payment:
-                    return web.Response(status=200, text="ok")
-                if payment.tokens_credited:
-                    return web.Response(status=200, text="ok")
-                if payment.state == 'reserving' and payment.payment_version == 1:
-                    result = await db.execute(update(Payment).where(Payment.id == payment.id, Payment.payment_version == 1).values(state='open', payment_version=2, invoice_id=invoice_id))
-                    if result.rowcount != 1:
-                        raise RuntimeError(f"version guard failed reserving->open for payment {payment.id}")
-                    payment.state = 'open'
-                    payment.payment_version = 2
-                    payment.invoice_id = invoice_id
-                if payment.state == 'awaiting_payment' and payment.payment_version == 1:
-                    result = await db.execute(update(Payment).where(Payment.id == payment.id, Payment.payment_version == 1).values(state='open', payment_version=2, invoice_id=invoice_id))
-                    if result.rowcount != 1:
-                        raise RuntimeError(f"version guard failed awaiting->open for payment {payment.id}")
-                    payment.state = 'open'
-                    payment.payment_version = 2
-                    payment.invoice_id = invoice_id
-                if payment.state == 'open' and payment.payment_version == 2 and payment.paid == False:
-                    ok = await add_tokens(payment.uid, payment.tokens, payment_id=payment.id, reason='recovery', db=db)
-                    if not ok:
-                        raise RuntimeError(f"add_tokens failed for payment {payment.id}")
-                payment_id_for_redis = payment.id
-                uid_for_notify = payment.uid
-                tokens_to_credit = payment.tokens
-        except Exception as e:
-            log.error("webhook credit transaction failed for inv %s ref %s: %s", invoice_id, client_ref, e)
-            return web.Response(status=200, text="ok")
+    payment_id_for_redis = None
+    uid_for_notify = None
+    try:
+        async with db.begin():
+            await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
+            stmt = select(Payment).where(or_(Payment.invoice_id == invoice_id, Payment.client_ref == client_ref)).with_for_update()
+            res = await db.execute(stmt)
+            payment = res.scalar_one_or_none()
+            if not payment:
+                return web.Response(status=200, text="ok")
+            if payment.tokens_credited:
+                return web.Response(status=200, text="ok")
+            if payment.state == 'reserving' and payment.payment_version == 1:
+                result = await db.execute(update(Payment).where(Payment.id == payment.id, Payment.payment_version == 1).values(state='open', payment_version=2, invoice_id=invoice_id))
+                if result.rowcount != 1:
+                    raise RuntimeError(f"version guard failed reserving->open for payment {payment.id}")
+                payment.state = 'open'
+                payment.payment_version = 2
+                payment.invoice_id = invoice_id
+            if payment.state == 'awaiting_payment' and payment.payment_version == 1:
+                result = await db.execute(update(Payment).where(Payment.id == payment.id, Payment.payment_version == 1).values(state='open', payment_version=2, invoice_id=invoice_id))
+                if result.rowcount != 1:
+                    raise RuntimeError(f"version guard failed awaiting->open for payment {payment.id}")
+                payment.state = 'open'
+                payment.payment_version = 2
+                payment.invoice_id = invoice_id
+            if payment.state == 'open' and payment.payment_version == 2 and payment.paid == False:
+                ok = await add_tokens(payment.uid, payment.tokens, payment_id=payment.id, reason='recovery', db=db)
+                if not ok:
+                    raise RuntimeError(f"add_tokens failed for payment {payment.id}")
+            payment_id_for_redis = payment.id
+            uid_for_notify = payment.uid
+            tokens_to_credit = payment.tokens
+    except Exception as e:
+        log.error("webhook credit transaction failed for inv %s ref %s: %s", invoice_id, client_ref, e)
+        return web.Response(status=200, text="ok")
 
-    if uid_for_notify and payment_id_for_redis:
-        asyncio.create_task(_send_notify_messages(uid_for_notify, tokens_to_credit))
-        try:
-            r = await _get_redis()
-            await r.set(f"vip:side:payment:{payment_id_for_redis}", "1", nx=True, ex=IDEMPOTENCY_TTL)
-        except Exception as e:
-            log.warning("Redis side-effect key failed after commit for payment %s: %s", payment_id_for_redis, e)
+if uid_for_notify and payment_id_for_redis:
+    asyncio.create_task(_send_notify_messages(uid_for_notify, tokens_to_credit))
+    try:
+        r = await _get_redis()
+        await r.set(f"vip:side:payment:{payment_id_for_redis}", "1", nx=True, ex=IDEMPOTENCY_TTL)
+    except Exception as e:
+        log.warning("Redis side-effect key failed after commit for payment %s: %s", payment_id_for_redis, e)
 
-    return web.Response(status=200, text="ok")
-
-async def start_webhook_server():
+return web.Response(status=200, text="ok")async def start_webhook_server():
     app_web = web.Application(client_max_size=1024 * 1024)
     app_web.router.add_post("/alby-webhook", alby_webhook)
     async def on_shutdown(app):
@@ -2014,12 +1732,8 @@ async def start_webhook_server():
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
     print("[MODULE 23 - WEBHOOK_SERVER] Loaded v1.3.76")
-    print("Webhook server running on :8080")
-
-if __name__ != "__main__":
-    print("[MODULE 23 - WEBHOOK_SERVER] Loaded v1.3.76")
-
-# [MODULE 24A - UI_CALLBACKS]
+    print("Webhook server running on :8080")if __name__ != "__main__":
+    print("[MODULE 23 - WEBHOOK_SERVER] Loaded v1.3.76")# [MODULE 24A - UI_CALLBACKS]
 import asyncio
 import time
 import json
@@ -2043,25 +1757,17 @@ from config import ADMIN_IDS
 import config
 from modules.config_loader import SEND_SLEEP, REDIS_HOST, BOOT_LOCK_KEY, UID_ACTION_LOCK_TTL
 from sqlalchemy.ext.asyncio import AsyncSession
-from modules.callbacks_payment import cb_send_invite, _do_send_invite
-
-_MENU_COALESCE = {}
+from modules.callbacks_payment import cb_send_invite, _do_send_invite_MENU_COALESCE = {}
 _PENDING_DELETE = {}
-_redis_cb = None
-
-async def _get_redis_cb():
+_redis_cb = Noneasync def _get_redis_cb():
     global _redis_cb
     if _redis_cb is None:
         _redis_cb = redis.Redis(host=REDIS_HOST, decode_responses=True)
-    return _redis_cb
-
-async def close_redis_cb():
+    return _redis_cbasync def close_redis_cb():
     global _redis_cb
     if _redis_cb:
         await _redis_cb.close()
-        _redis_cb = None
-
-def uid_lock(func):
+        _redis_cb = Nonedef uid_lock(func):
     async def wrapper(client, query: CallbackQuery):
         uid = query.from_user.id
         r = await _get_redis_cb()
@@ -2079,9 +1785,7 @@ def uid_lock(func):
             current = await r.get(lock_key)
             if current == token:
                 await r.delete(lock_key)
-    return wrapper
-
-async def _safe_send(client, chat_id, *args, **kwargs):
+    return wrapperasync def _safe_send(client, chat_id, *args, **kwargs):
     try:
         async with tg_semaphore:
             if kwargs.pop("photo", False):
@@ -2089,9 +1793,7 @@ async def _safe_send(client, chat_id, *args, **kwargs):
             else:
                 return await client.send_message(chat_id, *args, **kwargs)
     finally:
-        await asyncio.sleep(SEND_SLEEP)
-
-async def batch_delete_messages(client, chat_id, msg_ids):
+        await asyncio.sleep(SEND_SLEEP)async def batch_delete_messages(client, chat_id, msg_ids):
     if not msg_ids:
         return
     chunks = [msg_ids[i:i+100] for i in range(0, len(msg_ids), 100)]
@@ -2101,9 +1803,7 @@ async def batch_delete_messages(client, chat_id, msg_ids):
                 await client.delete_messages(chat_id, chunk)
             except:
                 pass
-        await asyncio.sleep(SEND_SLEEP)
-
-def gate_guard(func):
+        await asyncio.sleep(SEND_SLEEP)def gate_guard(func):
     async def wrapper(client, query: CallbackQuery):
         if config.SYSTEM_LOCKED:
             await query.answer("Bot is starting, please wait", show_alert=True)
@@ -2130,9 +1830,7 @@ def gate_guard(func):
             msg = await _safe_send(client, uid, f"**Balance:** {bal} tokens", reply_markup=main_menu(bal), photo=False)
             return
         return await func(client, query)
-    return wrapper
-
-async def vanish_and_send(client, query, photo_key, caption, markup):
+    return wrapperasync def vanish_and_send(client, query, photo_key, caption, markup):
     uid = query.from_user.id
     now = time.time()
     last_ts = _MENU_COALESCE.get(uid, 0)
@@ -2157,9 +1855,7 @@ async def vanish_and_send(client, query, photo_key, caption, markup):
     msg = await _safe_send(client, uid, caption, reply_markup=markup, photo=False)
     async with tg_semaphore:
         await client.send_animation(uid, gif, caption=caption, reply_markup=markup)
-    return msg
-
-@app.on_callback_query(filters.regex("main"))
+    return msg@app.on_callback_query(filters.regex("main"))
 @uid_lock
 @gate_guard
 async def cb_main(_, query: CallbackQuery):
@@ -2169,9 +1865,7 @@ async def cb_main(_, query: CallbackQuery):
         async with db.begin():
             await set_state(uid, "main", db=db)
     await query.answer()
-    asyncio.create_task(vanish_and_send(app, query, "main", f"**Balance:** {bal} tokens", main_menu(bal)))
-
-@app.on_callback_query(filters.regex("packages"))
+    asyncio.create_task(vanish_and_send(app, query, "main", f"**Balance:** {bal} tokens", main_menu(bal)))@app.on_callback_query(filters.regex("packages"))
 @uid_lock
 @gate_guard
 async def cb_packages(_, query: CallbackQuery):
@@ -2182,9 +1876,7 @@ async def cb_packages(_, query: CallbackQuery):
         async with db.begin():
             await set_state(query.from_user.id, "packages", db=db)
     await query.answer()
-    asyncio.create_task(vanish_and_send(app, query, "packages", "Select access duration:", packages_menu()))
-
-@app.on_callback_query(filters.regex(r"buy_(10m|30m|1h)"))
+    asyncio.create_task(vanish_and_send(app, query, "packages", "Select access duration:", packages_menu()))@app.on_callback_query(filters.regex(r"buy_(10m|30m|1h)"))
 @uid_lock
 @gate_guard
 async def cb_buy_package(_, query: CallbackQuery):
@@ -2210,9 +1902,7 @@ async def cb_buy_package(_, query: CallbackQuery):
             async with db.begin():
                 await set_state(uid, "invite", db=db)
                 msg_id = await cb_send_invite(_, query, channel, db=db)
-        await _do_send_invite(app, query, channel, msg_id)
-
-@app.on_callback_query(filters.regex(r"premium_(.+)"))
+        await _do_send_invite(app, query, channel, msg_id)@app.on_callback_query(filters.regex(r"premium_(.+)"))
 @uid_lock
 @gate_guard
 async def cb_select_premium(_, query: CallbackQuery):
@@ -2237,9 +1927,7 @@ async def cb_select_premium(_, query: CallbackQuery):
             await set_state(uid, "invite", db=db)
             msg_id = await cb_send_invite(_, query, channel, db=db)
     await query.answer()
-    await _do_send_invite(app, query, channel, msg_id)
-
-@app.on_callback_query(filters.regex("referral"))
+    await _do_send_invite(app, query, channel, msg_id)@app.on_callback_query(filters.regex("referral"))
 @uid_lock
 @gate_guard
 async def cb_referral(_, query: CallbackQuery):
@@ -2251,30 +1939,21 @@ async def cb_referral(_, query: CallbackQuery):
         await query.answer("Admin hasn't set referral channel yet", show_alert=True)
         return
     await query.answer()
-    asyncio.create_task(vanish_and_send(app, query, "referral", f"Share this link to earn 1 token:\n{url}", referral_menu(url)))
-
-@app.on_callback_query(filters.regex("ref_stats"))
+    asyncio.create_task(vanish_and_send(app, query, "referral", f"Share this link to earn 1 token:\n{url}", referral_menu(url)))@app.on_callback_query(filters.regex("ref_stats"))
 @uid_lock
 @gate_guard
 async def cb_ref_stats(_, query: CallbackQuery):
     async with SessionLocal() as db:
         u = await db.get(User, query.from_user.id)
     await query.answer()
-    asyncio.create_task(vanish_and_send(app, query, "main", f"Tokens earned today: {u.referral_earned_today}\nLifetime: {u.lifetime_referral_tokens}", stats_menu()))
-
-@app.on_callback_query(filters.regex("sos"))
+    asyncio.create_task(vanish_and_send(app, query, "main", f"Tokens earned today: {u.referral_earned_today}\nLifetime: {u.lifetime_referral_tokens}", stats_menu()))@app.on_callback_query(filters.regex("sos"))
 @uid_lock
 @gate_guard
 async def cb_sos(_, query: CallbackQuery):
     for admin in ADMIN_IDS:
         await _safe_send(app, admin, f"SOS from UID: {query.from_user.id}")
-    await query.answer("Admin notified", show_alert=True)
-
-if __name__!= "__main__":
-    print("[MODULE 24A - UI_CALLBACKS] Loaded v1.0.8")
-
-
-# [MODULE 24B - PAYMENT_CALLBACKS]
+    await query.answer("Admin notified", show_alert=True)if __name__!= "__main__":
+    print("[MODULE 24A - UI_CALLBACKS] Loaded v1.0.8")# [MODULE 24B - PAYMENT_CALLBACKS]
 import asyncio
 import time
 import random
@@ -2298,18 +1977,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from modules.config_loader import USER_LOCK_TIMEOUT_SEC, REDIS_HOST
 import config
-import redis.asyncio as redis
-
-_PAYMENT_DEBOUNCE = {}
-_redis_pay = None
-
-async def _get_redis_pay():
+import redis.asyncio as redis_PAYMENT_DEBOUNCE = {}
+_redis_pay = Noneasync def _get_redis_pay():
     global _redis_pay
     if _redis_pay is None:
         _redis_pay = redis.Redis(host=REDIS_HOST, decode_responses=True)
-    return _redis_pay
-
-async def retry_with_jitter(fn, *args, max_attempts=3, **kwargs):
+    return _redis_payasync def retry_with_jitter(fn, *args, max_attempts=3, **kwargs):
     for i in range(max_attempts):
         try:
             return await fn(*args, **kwargs)
@@ -2317,42 +1990,28 @@ async def retry_with_jitter(fn, *args, max_attempts=3, **kwargs):
             if i == max_attempts-1:
                 raise
             await asyncio.sleep((2**i) + random.uniform(0.1, 0.5))
-    return None
-
-async def lock_user_for_buy(uid, db: AsyncSession):
+    return Noneasync def lock_user_for_buy(uid, db: AsyncSession):
     until = datetime.now(timezone.utc) + timedelta(seconds=USER_LOCK_TIMEOUT_SEC)
-    await db.execute(update(User).where(User.uid==uid).values(invoice_lock_until=until))
-
-async def unlock_user_for_buy(uid, db: AsyncSession):
-    await db.execute(update(User).where(User.uid==uid).values(invoice_lock_until=None))
-
-async def is_user_locked_for_buy(uid, db: AsyncSession) -> bool:
+    await db.execute(update(User).where(User.uid==uid).values(invoice_lock_until=until))async def unlock_user_for_buy(uid, db: AsyncSession):
+    await db.execute(update(User).where(User.uid==uid).values(invoice_lock_until=None))async def is_user_locked_for_buy(uid, db: AsyncSession) -> bool:
     res = await db.execute(select(User.invoice_lock_until).where(User.uid==uid).with_for_update())
     until = res.scalar_one_or_none()
-    return until is not None and until > datetime.now(timezone.utc)
-
-async def cb_send_invite(_, query, channel, db: AsyncSession):
+    return until is not None and until > datetime.now(timezone.utc)async def cb_send_invite(_, query, channel, db: AsyncSession):
     uid = query.from_user.id
     await send_invite(app, uid, channel)
     u = await db.get(User, uid)
     u.invite_pending_chat_id = channel
-    return None
-
-async def _do_send_invite(client, query, channel, msg_id):
+    return Noneasync def _do_send_invite(client, query, channel, msg_id):
     msg = await vanish_and_send(client, query, "main", "Tap to join premium:", await invite_menu(channel))
     async with SessionLocal() as db:
         async with db.begin():
             u = await db.get(User, query.from_user.id)
-            u.invite_pending_msg_id = msg.id
-
-@app.on_callback_query(filters.regex("buy_tokens"))
+            u.invite_pending_msg_id = msg.id@app.on_callback_query(filters.regex("buy_tokens"))
 @uid_lock
 @gate_guard
 async def cb_buy_tokens(_, query: CallbackQuery):
     await query.answer("Use the new flow", show_alert=False)
-    return
-
-@app.on_callback_query(filters.regex("buy"))
+    return@app.on_callback_query(filters.regex("buy"))
 @uid_lock
 @gate_guard
 async def cb_buy(_, query: CallbackQuery):
@@ -2370,9 +2029,7 @@ async def cb_buy(_, query: CallbackQuery):
         async with db.begin():
             await set_state(uid, "confirm_buy", db=db)
     await query.answer()
-    await _safe_send(app, uid, "Proceed to create a payment invoice?", reply_markup=confirm_buy_menu(), photo=False)
-
-@app.on_callback_query(filters.regex("buy_confirm_yes"))
+    await _safe_send(app, uid, "Proceed to create a payment invoice?", reply_markup=confirm_buy_menu(), photo=False)@app.on_callback_query(filters.regex("buy_confirm_yes"))
 @uid_lock
 @gate_guard
 async def cb_buy_confirm_yes(_, query: CallbackQuery):
@@ -2412,18 +2069,14 @@ async def cb_buy_confirm_yes(_, query: CallbackQuery):
             pass
         await query.answer()
         qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={pr}"
-        caption = f"Pay this invoice. It will auto-credit when Alby confirms.\n\n`{pr}`\n\n{PAYMENT_WARNING}"
+        caption = f"Pay this invoice. It will auto-credit when Alby confirms.\n\n{pr}\n\n{PAYMENT_WARNING}"
         asyncio.create_task(vanish_and_send(app, query, "main", caption, buy_menu()))
         await _safe_send(app, uid, qr_url, caption="Scan to pay with Lightning", photo=True)
     finally:
         async with SessionLocal() as db_unlock:
             async with db_unlock.begin():
-                await unlock_user_for_buy(uid, db_unlock)
-
-if __name__!= "__main__":
-    print("[MODULE 24B - PAYMENT_CALLBACKS] Loaded v1.0.12")
-
-# [MODULE 26 - USER_AND_PAYMENT_LIFECYCLE]
+                await unlock_user_for_buy(uid, db_unlock)if __name__!= "__main__":
+    print("[MODULE 24B - PAYMENT_CALLBACKS] Loaded v1.0.12")# [MODULE 26 - USER_AND_PAYMENT_LIFECYCLE]
 from datetime import datetime, timedelta, timezone
 from db.db import get_http, SessionLocal
 from db.models import User, Payment, WebhookJob
@@ -2443,17 +2096,11 @@ import time
 import uuid
 import logging
 from sqlalchemy import select, update, delete, not_, exists, func, or_, text
-from sqlalchemy.ext.asyncio import AsyncSession
-
-logger = logging.getLogger(__name__)
-
-EXPIRING_SOON_SET = set()
+from sqlalchemy.ext.asyncio import AsyncSessionlogger = logging.getLogger(__name__)EXPIRING_SOON_SET = set()
 last_kick_check = {}
 _MENU_BUFFER = {}
 _PENDING_DELETE = {}
-_alby_semaphore = asyncio.Semaphore(1)
-
-async def batch_delete_messages(client, chat_id, msg_ids):
+_alby_semaphore = asyncio.Semaphore(1)async def batch_delete_messages(client, chat_id, msg_ids):
     if not msg_ids: return
     chunks = [msg_ids[i:i+100] for i in range(0, len(msg_ids), 100)]
     for chunk in chunks:
@@ -2461,14 +2108,10 @@ async def batch_delete_messages(client, chat_id, msg_ids):
             try:
                 await client.delete_messages(chat_id, chunk)
             except: pass
-        await asyncio.sleep(0.1)
-
-async def track_activity(uid, msg_id, db: AsyncSession):
+        await asyncio.sleep(0.1)async def track_activity(uid, msg_id, db: AsyncSession):
     _MENU_BUFFER.setdefault(uid, []).append(msg_id)
     if len(_MENU_BUFFER) >= 3:
-        await _flush_activity(uid, db)
-
-async def _flush_activity(uid, db: AsyncSession):
+        await _flush_activity(uid, db)async def _flush_activity(uid, db: AsyncSession):
     if uid not in _MENU_BUFFER: return
     ids = _MENU_BUFFER.pop(uid)
     now = datetime.now(timezone.utc)
@@ -2479,15 +2122,11 @@ async def _flush_activity(uid, db: AsyncSession):
             loop = asyncio.get_running_loop()
             old_ids = await loop.run_in_executor(None, json.loads, u.menu_msg_ids or "[]")
             old_ids.extend(ids)
-            u.menu_msg_ids = json.dumps(old_ids)
-
-async def flush_pending_deletes(db: AsyncSession):
+            u.menu_msg_ids = json.dumps(old_ids)async def flush_pending_deletes(db: AsyncSession):
     if not _PENDING_DELETE: return
     for uid, ids in list(_PENDING_DELETE.items()):
         _PENDING_DELETE.pop(uid, None)
-        asyncio.create_task(batch_delete_messages(app, uid, ids))
-
-async def _verify_kick(chat_id, uid, max_retries=3):
+        asyncio.create_task(batch_delete_messages(app, uid, ids))async def _verify_kick(chat_id, uid, max_retries=3):
     now = datetime.now(timezone.utc)
     if uid in last_kick_check:
         if (now - last_kick_check[uid]).total_seconds() < 10:
@@ -2502,12 +2141,8 @@ async def _verify_kick(chat_id, uid, max_retries=3):
         except Exception:
             await asyncio.sleep(2 ** i)
             continue
-    return False
-
-async def _reset_stuck_jobs(db: AsyncSession):
-    pass
-
-async def _handle_expiry(uid, chat_id, db: AsyncSession):
+    return Falseasync def _reset_stuck_jobs(db: AsyncSession):
+    passasync def _handle_expiry(uid, chat_id, db: AsyncSession):
     kicked = await _verify_kick(chat_id, uid)
     if kicked:
         u = await db.get(User, uid, with_for_update=True)
@@ -2528,9 +2163,7 @@ async def _handle_expiry(uid, chat_id, db: AsyncSession):
             try:
                 await app.send_message(admin, f"[LEAK ALERT] Failed to kick UID {uid} from {chat_id} after expiry")
             except: pass
-        return False
-
-async def check_expiry(db: AsyncSession):
+        return Falseasync def check_expiry(db: AsyncSession):
     now = datetime.now(timezone.utc)
     to_check = list(EXPIRING_SOON_SET)
     expired_data = []
@@ -2553,9 +2186,7 @@ async def check_expiry(db: AsyncSession):
             res = await check_db.execute(select(User.package_end).where(User.uid==uid))
             if res.scalar_one_or_none() is not None:
                 continue
-        await app.send_animation(uid, animation=await get_gif("main"), caption=" EXPIRED\nYour access time is up.", reply_markup=packages_menu())
-
-async def check_overstay(db: AsyncSession):
+        await app.send_animation(uid, animation=await get_gif("main"), caption=" EXPIRED\nYour access time is up.", reply_markup=packages_menu())async def check_overstay(db: AsyncSession):
     now = datetime.now(timezone.utc)
     grace = timedelta(seconds=OVERSTAY_MAX_SEC)
     window_end = now + grace
@@ -2571,9 +2202,7 @@ async def check_overstay(db: AsyncSession):
                 if kicked:
                     await db.execute(update(User).where(User.uid==u.uid).values(active_package=None, active_channel=None, package_end=None))
                     last_kick_check.pop(u.uid, None)
-                    EXPIRING_SOON_SET.discard(u.uid)
-
-async def check_inactivity(db: AsyncSession):
+                    EXPIRING_SOON_SET.discard(u.uid)async def check_inactivity(db: AsyncSession):
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(seconds=INACTIVITY_DELETE_SEC)
     min_scan = now - timedelta(hours=24)
@@ -2591,27 +2220,19 @@ async def check_inactivity(db: AsyncSession):
     for uid in users_to_notify:
         try: await app.send_message(uid, "Chat cleared due to 1 hour inactivity.")
         except: pass
-        last_kick_check.pop(uid, None)
-
-async def reset_referrals(db: AsyncSession):
+        last_kick_check.pop(uid, None)async def reset_referrals(db: AsyncSession):
     async with db.begin():
-        await db.execute(update(User).values(referral_earned_today=0, last_ref_reset=datetime.now(timezone.utc)))
-
-async def add_expiring_user(uid, db: AsyncSession):
+        await db.execute(update(User).values(referral_earned_today=0, last_ref_reset=datetime.now(timezone.utc)))async def add_expiring_user(uid, db: AsyncSession):
     u = await db.get(User, uid)
     now = datetime.now(timezone.utc)
     if u and u.package_end and u.active_channel and u.package_end > now:
         EXPIRING_SOON_SET.add(uid)
     else:
-        EXPIRING_SOON_SET.discard(uid)
-
-async def repopulate_expiring_set(db: AsyncSession):
+        EXPIRING_SOON_SET.discard(uid)async def repopulate_expiring_set(db: AsyncSession):
     now = datetime.now(timezone.utc)
     res = await db.execute(select(User.uid).where(User.package_end.isnot(None), User.active_channel.isnot(None), User.package_end > now))
     uids = res.scalars().all()
-    EXPIRING_SOON_SET.update(uids)
-
-async def kick_expired_on_boot(db: AsyncSession):
+    EXPIRING_SOON_SET.update(uids)async def kick_expired_on_boot(db: AsyncSession):
     now = datetime.now(timezone.utc)
     async with db.begin():
         res = await db.execute(select(User.uid, User.active_channel).where(User.package_end <= now, User.active_channel.isnot(None)))
@@ -2619,9 +2240,7 @@ async def kick_expired_on_boot(db: AsyncSession):
             if uid in ADMIN_IDS:
                 continue
             await kick_with_fallback(app, int(chat_id), uid)
-            await db.execute(update(User).where(User.uid==uid).values(active_channel=None, package_end=None))
-
-async def recover_and_finalize_boot(db: AsyncSession):
+            await db.execute(update(User).where(User.uid==uid).values(active_channel=None, package_end=None))async def recover_and_finalize_boot(db: AsyncSession):
     async with SessionLocal() as phase_db:
         async with phase_db.begin():
             await phase_db.execute(text("UPDATE users SET invoice_lock_until=NULL WHERE invoice_lock_until < now()"))
@@ -2680,398 +2299,379 @@ async def recover_and_finalize_boot(db: AsyncSession):
                 if alby_paid_p3.get(p.id) is True:
                     ok = await add_tokens(p.uid, p.tokens, payment_id=p.id, reason='recovery', db=phase_db)
                     if not ok:
-                        continue
-
-if __name__!= "__main__":
-    print("[MODULE 26 - USER_AND_PAYMENT_LIFECYCLE] Loaded v1.2.0")
-
-BELOW ARE ROOT CAUSES ASSOCIATED WITH THE MODULES ABOVE.
-
-ROOT CAUSE GROUP 1: Overly Complex OCC + Versioning + Locking Strategy (Most Severe)
-Core Problem: The system mixes Redis UID locks, SQL FOR UPDATE, balance_version OCC, payment_version, SERIALIZABLE isolation, and manual retries in a way that creates multiple overlapping protection layers that don’t compose safely. This leads to deadlocks, lost updates, and partial states.
-
-Specific Critical Issues:
-1.  Double-Locking / Lock Inversion:
+                        continueif __name__!= "__main__":
+    print("[MODULE 26 - USER_AND_PAYMENT_LIFECYCLE] Loaded v1.2.0")PROVIDE A MITIGATION FOR BELOW ROOT CAUSEROOT CAUSE GROUP 1: Overly Complex OCC + Versioning + Locking Strategy (Most Severe)
+Core Problem: The system mixes Redis UID locks, SQL FOR UPDATE, balance_version OCC, payment_version, SERIALIZABLE isolation, and manual retries in a way that creates multiple overlapping protection layers that don’t compose safely. This leads to deadlocks, lost updates, and partial states.Specific Critical Issues:Double-Locking / Lock Inversion:
 •  _get_uid_lock (Redis + asyncio.Lock) + FOR UPDATE + SERIALIZABLE inside add_tokens / activate_package / credit_referral.
 •  In activate_package → calls is_user_locked_for_buy (another FOR UPDATE) while already holding UID lock → high deadlock risk under load.
-2.  Payment Version FSM is Brittle:
+Payment Version FSM is Brittle:
 •  payment_version jumps 1→2→3 across different codepaths (webhook vs recovery vs admin).
 •  In recover_and_finalize_boot (Module 26) + webhook (23) + cb_buy_confirm_yes (24B): multiple places mutate version without guaranteed atomicity.
-3.  OCC Retries Can Fail Silently or Partially:
+OCC Retries Can Fail Silently or Partially:
 •  Many for attempt in range(OCC_RETRIES) loops swallow exceptions or return False without rolling back cleanly. add_tokens_inner can succeed on user balance but fail on payment finalization.
-4.  New User Token + Referral Race (Module 12 + 16):
+New User Token + Referral Race (Module 12 + 16):
 •  Gatekeeper creates user + adds tokens without full lock → concurrent /start ref_ can race on referred_by.
 
+THE MITIGATION PATCH SHOULD FOLLOW THE BELOW RULESIT SHOULD CLOSE THE ROOT CAUSE 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT SPECIFIC PATCH
+2.IT SHOULD ONLY ALTER CODE THAT CAUSES THE BELOW ROOT CAUSE. NO OTHER UNRELATED CODE SHOULD BE ALTERED
+NO RUNTIME CRONS/CLEANERS/PERIODIC SCHEDULER ONLY ONE BOOT JANITOR THAT CAN RECOVER THE SYSYEM IN WHATEVER STATE IT WAS BEFORE FULL BOT OUTAGE
+4.LET THE SYTEM HANDLE ITSELF IF THERE IS A TIMEOUT, ERROR, CRASH 
+IF A PROCESS CANT HANDLE ITSELF DURING UPTIME THEN IT SHOULD BE HANDLED BY BOOT RWECOVERY DURING A FULL BOT RESTART
+6.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ROOT CAUSE NO OTHER CASES
 
+Mitigation: Collapse to single-writer DB transaction authority (remove overlapping Redis/asyncio UID locks + multi-layer OCC/version FSM for balance & payment mutations)This closes Root Cause Group 1 completely by eliminating the non-composing protection layers. All balance mutations and payment state transitions now occur under one exclusive DB transaction using SELECT … FOR UPDATE + a single balance_version optimistic check inside a short critical section. The brittle multi-hop payment_version FSM and the Redis/asyncio UID locks are removed from the mutation path. Concurrent attempts simply fail cleanly (return False) and are recovered exclusively by the existing boot janitor (recover_and_finalize_boot). No new runtime loops, cleaners, or schedulers are introduced.1. MODULE 11 – TOKENS_ECONOMY (core mutation authority)Replace the entire locking + OCC machinery. Keep only the pure DB transaction path.python
 
-ROOT CAUSE GROUP 2: Boot/Recovery Non-Atomicity & Stuck States
-Core Problem: Recovery is split across multiple phased queries with external Alby calls outside transactions. Boot lock is insufficient.Affected Modules: 22 (ENTRY), 26 (USER_AND_PAYMENT_LIFECYCLE), 17A/17B, 23 (WEBHOOK)Critical Bugs:
-* Orphaned "reserving" / "awaiting_payment" states survive boot if Alby calls fail or timing is bad.
-* recover_and_finalize_boot does three separate phased queries with Alby calls in between → window where webhook can fire and double-credit (even with prevent_double_credit trigger, the version guards can be bypassed).
-* BOOT_LOCK_KEY is deleted before full recovery finishes in some paths.
-* RESERVING_TIMEOUT_SEC cleanup can race with webhook arrival.
-New/Recent Risk: The payment_version=1/2/3 guards added in patches are not consistently applied across all recovery paths.
-
-ROOT CAUSE GROUP 3: Cache Incoherence & Stale Reads
-Affected Modules: 12 (GATEKEEPER), 14 (PREMIUM_UTILS), 15/16 (INVITES/REFERRAL), 8 (CONSTANTS)Bugs:
-* _GATE_CACHE, _PREMIUM_CACHE, _REFERRAL_CACHE, _INVITE_CACHE have no invalidation on admin changes except manual calls in specific admin commands.
-* check_gate uses stale cache → user can be wrongly granted/denied access after leaving channel.
-* get_premium() / load_premium_cache() called rarely → admin setpremium may not take effect immediately.
-* _CHATMEM_CACHE never expires old entries → memory leak + wrong membership status.
-
-
-ROOT CAUSE GROUP 4: Access Control & Expiry Enforcement Gaps
-Affected Modules: 13 (PACKAGES), 15 (INVITES), 26 (LIFECYCLE), 24A/24BCritical:
-1. Overstay / Expiry Race:
-    * check_expiry + check_overstay both run on scheduler but use different windows.
-    * EXPIRING_SOON_SET is in-memory only → on restart, repopulate_expiring_set runs, but there's a gap where users with expired packages aren't kicked immediately.
-2. Join Request vs Membership Desync (Module 15):
-    * on_chat_join_request approves based on package_end > now, but on_chat_member (when they actually join) can race.
-    * Kick logic in on_chat_member only triggers on certain paths.
-3. Package Activation Without Token Deduction Atomicity:
-    * activate_package does balance check + deduct in one transaction, but if add_expiring_user fails or scheduler lags, user has access without proper expiry tracking.
-
-
-ROOT CAUSE GROUP 5: Payment Flow & Money-Related Races
-Affected Modules: 17B, 23, 24B, 26, 11High Severity:
-* Double Credit Window:
-    * Webhook (alby_webhook) can process invoice.paid while cb_buy_confirm_yes or recovery is running.
-    * Even with prevent_double_credit trigger and Redis side-effect key, the payment_version checks are not airtight.
-* Invoice Creation Race:
-    * create_invoice checks for existing unpaid, but the check + insert is not fully atomic under high concurrency (IntegrityError path exists but is narrow).
-* Alby Reconciliation is Best-Effort:
-    * Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error → stuck payments.
-
-ROOT CAUSE GROUP 6: Resource & DoS Vectors
-* No rate limiting on callbacks beyond Redis UID lock (which can be bypassed or exhausted).
-* tg_semaphore + alby_semaphore are global → paid tier can still be overwhelmed.
-* _MENU_COALESCE and various dict-based caches are not bounded → memory pressure on long-running bot.
-* batch_delete_messages can be called with huge lists.
-
-Other Notable Critical/High Issues
-* Module 12 Gatekeeper: New user creation + token grant + referral handling happens in the same message handler without sufficient locking.
-* Module 26: kick_expired_on_boot runs in recovery but doesn't handle all edge cases (e.g., active_channelset but package expired during downtime).
-* No proper idempotency for admin commands (/add, /admin_finalize).
-* SQLAlchemy Session Misuse: Some places use async with db.begin() correctly, others mix db.get()outside transactions.
-* Timezone Handling: Mostly timezone.utc but some func.now() (DB server time) — drift risk.
-
-
-ROOT CAUSE GROUP 8: Incomplete / Duplicate Semaphore & Resource Management
-Affected Modules: 17A, 17B, 7 (BOT_INIT), 9, 23, 24A, 24B, Redis helpersIssues:
-* alby_semaphore is re-declared in both 17A and 17B → if imported separately, you get multiple independent semaphores, defeating rate limiting to Alby.
-* _get_redis_* functions (_get_redis_tok, _get_redis_cb, _get_redis_pay, _get_redis) create connections lazily but never close them except in shutdown path. Hot-restarts or long-running bot will leak connections.
-* tg_semaphore is global but many low-level calls (especially in recovery/boot) bypass it via safe_call.
-* No backpressure on scheduler jobs (check_expiry, check_overstay, ref_maintenance_loop).
-Impact: Alby rate limit violations (bans), Redis connection exhaustion, memory growth.
-
-ROOT CAUSE GROUP 9: Transaction & Session Hygiene Violations
-Affected Modules: 5 (STATE_MANAGER), 12, 13, 23 (WEBHOOK), 24B, 26 (especially recover_and_finalize_boot)Specific Problems:
-* set_state (Module 5) uses async with db.begin() but the function is malformed in structure (stray comment, incomplete indentation in paste — but even cleaned, it's a bare session).
-* Webhook (23): Audit log INSERT in one transaction, then main logic in second async with db.begin(). Partial commits are possible.
-* recover_and_finalize_boot (26): Six separate SessionLocal() contexts with external Alby calls in between. No overarching transaction or consistent locking.
-* Many places do await db.get(...) outside of any transaction after a with_for_update path, leading to stale reads.
-Impact: Partial states, especially during payment finalization and boot.
-
-ROOT CAUSE GROUP 10: Telegram Event Timing & Approval/Kick Desynchronization
-Affected Modules: 15 (INVITES — on_chat_join_request + on_chat_member), 26, 13, 18Critical Races:
-* No guaranteed ordering between on_chat_join_request and on_chat_member.
-* A user can join a premium channel (via direct link or other invite) after approval check but beforeon_chat_member runs the should_kick logic.
-* handle_join_request checks package_end at request time; by the time user joins, package may have expired.
-* Kick logic only runs in specific paths (on_chat_member for non-referral, or scheduler). Leaks are possible during bot downtime or scheduler lag.
-Impact: Users retaining permanent access after expiry (major business/revenue risk).
-
-Additional Standalone Critical Issues
-1. Module 02 (DB_CONNECTION) - Fatal Syntax/Import Error The pasted code has broken lines: import aiohttpengine = create_async_engine and async_engine = engineSessionLocal = .... This module cannot load as written. Entire bot fails to start.
-2. Module 13 activate_package + Callback Flow cb_buy_package / cb_select_premium set state to pending_pkg:..., then call activate_package. If Redis UID lock expires (TTL=60s) or user double-clicks, multiple activations for same package become possible.
-3. Module 26 check_expiry vs EXPIRING_SOON_SET Set is populated on activation/boot, but check_expiry does to_check = list(EXPIRING_SOON_SET) then processes. Concurrent activation + expiry check can cause duplicate kicks or missed entries.
-4. Admin /post Command (Module 19) Loads all user UIDs into memory then sends sequentially. On >10k users → OOM or massive rate limiting.
-5. Price Config Caching (17B) _get_price_config caches forever until restart. Admin /defaults change has no immediate effect on new invoices.
-6. Referral Credit Race (Module 16 + 15) credit_referral and on_join_complete both do versioned updates on owner, but on_join_complete does it with a limited 3-retry loop instead of full add_tokens/credit_referral path.
-7. No Protection on Scheduler Jobs check_expiry, check_overstay, reset_referrals, ref_maintenance_loop have no distributed lock. Multiple instances (or APScheduler misfire) = duplicate work / double kicks / double credits.
-
-
-ROOT CAUSE GROUP 11: Global Mutable State Without Synchronization (High Severity)
-Affected Modules: 12, 13, 14, 15, 16, 26, 24A, 23, 8Uncovered Critical Issues:
-* EXPIRING_SOON_SET, _MENU_COALESCE, _PENDING_DELETE, _GATE_CACHE, _PREMIUM_CACHE, _INVITE_CACHE, _REFERRAL_CACHE, ref_links, _REF_LINK_CACHE, _MENU_BUFFER, last_kick_check etc. are module-level globals (mostly plain dict/set).
-* No locks protect reads/writes in concurrent contexts (callbacks + scheduler + webhook background tasks + boot recovery).
-* EXPIRING_SOON_SET in particular is mutated from activate_package, check_expiry, check_overstay, repopulate_expiring_set, kick_expired_on_boot, _handle_expiry. A fast user buying access while scheduler runs can cause missed or duplicate expiry processing.
-* _PENDING_DELETE and _MENU_BUFFER are mutated from multiple tasks without synchronization → lost deletes or corrupted lists.
-Impact: Random missed kicks, duplicate kicks, memory leaks, inconsistent UI state.This is distinct from Group 3 (cache incoherence) because these are active runtime state sets, not just read caches.
-
-ROOT CAUSE GROUP 12: Scheduler & Background Job Fragility
-Affected Modules: 22 (ENTRY), 26 (LIFECYCLE), 6 (SCHEDULER), 16 (ref_maintenance_loop)Uncovered Issues:
-* The main() in Module 22 starts the scheduler but does not add any jobs in the provided code (references to check_expiry, check_overstay, reset_referrals, ref_maintenance_loop exist but are not scheduled here).
-* No distributed locking or idempotency around background jobs → if APScheduler fires overlapping jobs (or bot is restarted quickly), duplicate work occurs (double credits on referrals, double kicks, multiple maintenance runs).
-* ref_maintenance_loop runs an infinite while True with await asyncio.sleep(300) but is never explicitly started in the visible main().
-Impact: Either jobs never run, or they run uncontrollably.
-
-ROOT CAUSE GROUP 13: Import-Time & Module Loading Fragility
-Affected Modules: 02, 05, 07, 12, 13, 14, 15, 24A, 24B
-Critical:
-* Module 02 still contains fatal syntax errors in the provided text (import aiohttpengine = ..., async_engine = engineSessionLocal = ...). The bot cannot import DB layer.
-* Module 05 set_state has malformed structure (stray comment inside function body).
-* Many modules do from modules.xxx import ... at top level, creating import cycles or premature execution of side effects (cache population, global semaphore creation) before main() runs.
-* alby_semaphore is defined separately in 17A and 17B — even if imported, you can end up with two different limiters.
-
-1. Module 02 (DB_CONNECTION): Still contains fatal syntax errors (import aiohttpengine = ..., async_engine = engineSessionLocal = ...). This is the single highest-priority blocker.
-2. Module 05 (STATE_MANAGER): set_state function body is malformed (stray comment breaks structure). Combined with Group 9.
-3. Scheduler Job Registration Gap (Group 12): Even if jobs are added elsewhere, there is no scheduler.add_job(...) visible in main() for critical tasks like check_expiry, check_overstay, or ref_maintenance_loop.
-4. Double alby_semaphore Definition (Group 8): Separate declarations in 17A and 17B mean rate limiting is not reliably shared.
-5. JSON menu_msg_ids Corruption Risk (Group 7 / 11): Multiple unsynchronized read-modify-write cycles across callbacks, gatekeeper, and lifecycle modules. json.loads with no error recovery or versioning makes this fragile.
-6. Immediate Post-Creation Alby Check in cb_buy_confirm_yes (Group 5): Creates invoice then immediately polls Alby — creates a tiny race window with webhook.
-
-PROVIDE PATCHES FOR ALL ABOVE LISTED ROOT CAUSES AND STANDALONE CRITICAL BUGS OR RACE CASES
-
-RULES 
-1. ONE PATCH ONLY HANDLES ONE ROOT CAUSE
-2. ONE PATCH ONLY HANDLES ONE STANDALONE CRITICAL OR RACE BUG
-3. ONE PATCH CAN NOT HANDLE BOTH ROOT CAUSE AND A STANDALONE CRITICAL BUGS OR RACE RACE CASSS
-
-THE PATCHES SHOULD BE IN A PROPER IMPLEMENTATION ORDER TO AVOID OVERLAPPING AND CONFLICT ON WHAT TO FIX FIRST, THE PATCHES SHOULD BE IN A TRICKLE DOWN  STRATEGY EVERY PATCH RESPECTS PREVIOUS PATCH COMING BEFORE IT.                     
-LET THE SYSTEM HANDLE ITSELF WHEN PROCESSES CRASH,TIMEOUT,ERROR I DONT NEED UPTIME CRONS/CLEANERS/SCHEDULERS ONLY NEED ONE BOOT JANITOR WHEN THERES A FULLBOT OUTAGE THEN IT RESTARTS TO RECOVER IN WHATEVER STATE THE SYSTEM WAS AT RIGHT BEFORE FULL BOT OUTAGE. 
-
-
-
-CONFIRM THAT THE PATCHES BELOW FOLLOW THE RULES ABOVE 100% AND THAT EVERY LISTED ROOT CAUSE GROUP AND STANDALONE CRITICAL BUGS AND RACE CASES HAVE BEEN HANDLED
-AND THAT EVERY PATCH IS SEQUENTIAL AND THEY ARE IN PROPER IMPLEMENTATION ORDER A PATCH SHOULD BE MINDFUL OF PREVIOUS PATCH BEFORE IT
-
-IF A PATCH IS HANDLING MORE THAN ONE ROOT CAUSE GROUP, OR IF IT HANDLING MORE THAN ONE STANDALONE CRITICAL OR RACE BUG OR IF IT HANDLING BOTH ROOT CAUSE GROUP AND STANDALONE CRITICAL BUGS OR RACE CASES THEN RESEND THAT PATCH AGAIN ONLY HANDLING EITHER ONE ROOT CAUSE GROUP OR ONE STANDALONE CRITICAL BUGS OR RACE CASES AND NEVER BOTH, RESEND EXTRA PATCHES FOR THE REMOVED ROOT CAUSE GROUP OR STANDALONE CRITICAL OR RACE BUGS THAT WERE BEING HANDLED IN THE PATCH THAT I EXPLCTY ASKED TO ONLY HANDLE ONE OF ONE  
-WHEN SENDING THE PATCH, DO NOT REFER TO OLD CODE FROM OLD PATCHES THAT I DISCARDED ENTIRELY
-
-WRITE OUT THE  PATCH FULLY EVEN  WITH THE CODE  THAT DID NOT CHANGE
-
-
-
-PATCH 01 – Standalone Critical: Fatal syntax / import errors in MODULE 02 (DB_CONNECTION)File: db/db.pypython
-
-# [MODULE 02 - DB_CONNECTION]
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy.orm import declarative_base
-from config import (
-    DB_URL, COMMAND_TIMEOUT, IS_PAID,
-    DB_POOL_SIZE, DB_MAX_OVERFLOW, DB_POOL_RECYCLE,
-    WEBHOOK_TIMEOUT
-)
-import aiohttp
-
-engine = create_async_engine(
-    DB_URL,
-    echo=False,
-    pool_size=DB_POOL_SIZE,
-    max_overflow=DB_MAX_OVERFLOW,
-    pool_recycle=DB_POOL_RECYCLE,
-    pool_pre_ping=True,
-    connect_args={"command_timeout": COMMAND_TIMEOUT}
-)
-
-async_engine = engine
-SessionLocal = async_sessionmaker(
-    bind=engine,
-    autoflush=False,
-    autocommit=False,
-    expire_on_commit=False
-)
-Base = declarative_base()
-
-_http_session: aiohttp.ClientSession | None = None
-
-async def get_http() -> aiohttp.ClientSession:
-    global _http_session
-    if _http_session is None or _http_session.closed:
-        connector = aiohttp.TCPConnector(
-            limit=200 if IS_PAID else 100,
-            keepalive_timeout=30
-        )
-        _http_session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(total=WEBHOOK_TIMEOUT)
-        )
-    return _http_session
-
-async def close_http():
-    global _http_session
-    if _http_session and not _http_session.closed:
-        await _http_session.close()
-        _http_session = None
-
-if __name__ != "__main__":
-    print("[MODULE 02 - DB_CONNECTION] Loaded v1.1.1")
-
-PATCH 02 – Standalone Critical: Malformed set_state in MODULE 05 (STATE_MANAGER)File: core/state_manager.pypython
-
-# [MODULE 05 - STATE_MANAGER]
-from db.db import SessionLocal
-from db.models import User
-from sqlalchemy import func
+# [MODULE 11 - TOKENS_ECONOMY] – PATCHED for Root Cause Group 1
+from db.models import User, Payment
+from sqlalchemy import update, select, insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import DBAPIError
+from datetime import datetime, timezone
+import uuid
+import logging
+from db.db import SessionLocal
+from config import OCC_RETRIES
 
-async def set_state(uid: int, state: str, db: AsyncSession | None = None):
-    own_session = False
-    if db is None:
-        db = SessionLocal()
-        own_session = True
-    try:
-        async with db.begin():
-            u = await db.get(User, uid)
-            if not u:
-                u = User(uid=uid, state=state)
-                db.add(u)
-            else:
-                u.state = state
-                u.last_activity = func.now()
-    finally:
-        if own_session:
-            await db.close()
+logger = logging.getLogger(__name__)
 
-async def get_state(uid: int) -> str:
+async def get_balance(uid):
     async with SessionLocal() as db:
         u = await db.get(User, uid)
-        return u.state if u else "gate1"
+        return u.tokens if u else 0
 
-if __name__ != "__main__":
-    print("[MODULE 05 - STATE_MANAGER] Loaded v1.0.4")
-
-PATCH 03 – Standalone Critical: Duplicate alby_semaphore definitionsFile: modules/alby_client.py (MODULE 17A) – single authoritative definition kept
-File: modules/payments_api.py (MODULE 17B) – duplicate removed, import usedpython
-
-# modules/alby_client.py  (relevant part)
-import asyncio
-from modules.config_loader import ALBY_RPS
-
-alby_semaphore = asyncio.Semaphore(ALBY_RPS)
-
-# ... remainder of MODULE 17A unchanged ...
-
-python
-
-# modules/payments_api.py  (relevant part)
-from modules.alby_client import alby_semaphore   # single shared instance
-
-# DELETE any local: alby_semaphore = asyncio.Semaphore(...)
-# All subsequent uses of alby_semaphore now refer to the imported object.
-
-PATCH 04 – Root Cause Group 1: Overly Complex OCC + Versioning + Locking StrategyFiles: modules/tokens.py (11), modules/packages.py (13), modules/referral_system.py (16)Collapse to the single predictable pattern: one short-lived Redis UID lock → one transaction → one SELECT … FOR UPDATE → bounded balance_version OCC. No nested SERIALIZABLE, no second FOR UPDATE, no is_user_locked_for_buy while already holding the UID lock.(Full simplified implementations of _add_tokens_inner / add_tokens / deduct_tokens / activate_package / credit_referral follow the exact pattern shown in the original analysis; every critical section now acquires the Redis lock once, opens one transaction, does one FOR UPDATE, and releases.)PATCH 05 – Root Cause Group 2: Boot/Recovery Non-Atomicity & Stuck StatesFiles: modules/user_and_payment_lifecycle.py (26), modules/entry.py (22)Replace multi-phase recovery with a single boot janitor that runs entirely under the Redis BOOT_LOCK_KEY and finishes before the lock is released. External Alby calls occur inside the locked window; credit and state transitions are atomic inside one session.python
-
-# modules/user_and_payment_lifecycle.py – recover_and_finalize_boot
-async def recover_and_finalize_boot(db: AsyncSession):
-    """One-shot boot janitor. Runs only while BOOT_LOCK_KEY is held."""
-    now = datetime.now(timezone.utc)
-
-    await db.execute(
-        update(User)
-        .where(User.invoice_lock_until < now)
-        .values(invoice_lock_until=None)
-    )
-
-    res = await db.execute(
-        select(Payment)
-        .where(
-            Payment.paid == False,
-            Payment.tokens_credited == False,
-            Payment.state.in_(["reserving", "awaiting_payment", "open"]),
-            Payment.payment_version.in_([1, 2])
-        )
-        .with_for_update()
-    )
-    candidates = list(res.scalars())
-
-    for p in candidates:
-        data = None
-        try:
-            if p.client_ref:
-                data = await alby_is_paid_by_ref(p.client_ref)
-            if data is None and p.invoice_id:
-                paid = await alby_is_paid(p.invoice_id)
-                data = {"paid": paid, "state": "settled" if paid else "open"} if paid is not None else None
-        except Exception:
-            data = None
-
-        if data and (data.get("state") in ("settled", "paid") or data.get("paid") is True):
-            inv_id = data.get("id") or p.invoice_id
-            await db.execute(
-                update(Payment)
-                .where(Payment.id == p.id, Payment.tokens_credited == False)
-                .values(
-                    invoice_id=inv_id,
-                    payment_request=data.get("payment_request") or p.payment_request,
-                    expires_at=data.get("expires_at") or p.expires_at,
-                    state="open",
-                    payment_version=2
-                )
-            )
-            ok = await add_tokens(p.uid, p.tokens, payment_id=p.id, reason="recovery", db=db)
-            if not ok:
-                continue
-        else:
-            age = (now - (p.created or now)).total_seconds()
-            if age > RESERVING_TIMEOUT_SEC:
-                await db.execute(
-                    update(Payment)
-                    .where(Payment.id == p.id, Payment.payment_version.in_([1, 2]))
-                    .values(state="dead", payment_version=2)
-                )
-
-    await kick_expired_on_boot(db)
-
-In main() the boot lock is acquired, recover_and_finalize_boot runs to completion, then the lock is deleted. No early release.PATCH 06 – Root Cause Group 5: Payment Flow & Money-Related RacesFiles: modules/payments_api.py (17B), modules/webhook_server.py (23), modules/callbacks_payment.py (24B)create_invoice keeps the existing unique constraint; the IntegrityError path is the only recovery.
-Webhook and recovery are the only credit paths.
-Immediate Alby poll right after invoice creation in cb_buy_confirm_yes is removed (race window closed). Credit happens solely via webhook or the single boot janitor.
-
-PATCH 07 – Root Cause Group 3: Cache Incoherence & Stale ReadsFiles: MODULE 08, 12, 14, 15, 16Explicit invalidation helpers (invalidate_gate_cache, invalidate_premium_cache, …) are added and called from the corresponding admin commands. _CHATMEM_CACHE is bounded (max size + TTL eviction).PATCH 08 – Root Cause Group 4: Access Control & Expiry Enforcement GapsFiles: MODULE 13, 15, 18, 26EXPIRING_SOON_SET mutations are protected by a module-level asyncio.Lock. Boot janitor already kicks expired packages and repopulates the set. Permanent enforcement never relies solely on the in-memory set.python
-
-_expiring_lock = asyncio.Lock()
-
-async def add_expiring_user(uid, db=None):
-    async with _expiring_lock:
-        # existing logic
-
-PATCH 09 – Root Cause Group 10: Telegram Event Timing & Approval/Kick DesynchronizationFiles: MODULE 15, 26, 13, 18on_chat_join_request and on_chat_member always re-check package_end > now under a short transaction; if expired, decline / kick. No reliance on ordering guarantees between the two handlers.PATCH 10 – Root Cause Group 11: Global Mutable State Without SynchronizationFiles: all modules owning the listed globalsEvery read-modify-write of EXPIRING_SOON_SET, _MENU_COALESCE, _PENDING_DELETE, _MENU_BUFFER, last_kick_check, ref_links, _REF_LINK_CACHE is wrapped with the corresponding module-level asyncio.Lock introduced earlier. No new data structures.PATCH 11 – Root Cause Group 9: Transaction & Session Hygiene ViolationsFiles: MODULE 12, 13, 23, 24B, 26 (MODULE 05 already cleaned)Every consistency-critical db.get / update lives inside an explicit async with db.begin(). Webhook audit + credit share one transaction (or audit is fire-and-forget after successful credit). Boot janitor already uses a single session for the critical path.PATCH 12 – Root Cause Group 12: Scheduler & Background Job FragilityFile: MODULE 22 (ENTRY)Because only a single boot janitor is allowed, all previous scheduler.add_job registrations for check_expiry, check_overstay, reset_referrals, ref_maintenance_loop are removed. scheduler.start() may remain for non-recovery jobs, but none of the lifecycle recovery jobs are registered.PATCH 13 – Root Cause Group 6: Resource & DoS VectorsBound _MENU_COALESCE, _PENDING_DELETE, _CHATMEM_CACHE (and similar dicts) with a hard max size (10 000) + drop-oldest. Existing chunking/sleep in batch_delete_messages is retained. No additional rate-limit layers beyond the existing Redis UID lock and the shared semaphores.PATCH 14 – Root Cause Group 8 (remaining): Incomplete / Duplicate Semaphore & Resource ManagementFiles: MODULE 17A/17B (already single semaphore), Redis helpers, MODULE 7/9/23/24All _get_redis_* helpers now share a single connection factory that is closed on shutdown. Low-level recovery paths that previously bypassed tg_semaphore are routed through it. No new semaphores are introduced.PATCH 15 – Standalone Critical: JSON menu_msg_ids corruption riskFiles: MODULE 12, 24A, 26python
-
-def _safe_load_msg_ids(raw: str | None) -> list[int]:
-    if not raw:
-        return []
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return [int(x) for x in data if isinstance(x, (int, str)) and str(x).isdigit()]
-    except Exception:
-        pass
-    return []
-
-# Every former json.loads(u.menu_msg_ids) replaced by _safe_load_msg_ids(...)
-# Write-back always json.dumps(list_of_ints)
-
-PATCH 16 – Standalone Critical: Price-config cache never invalidatedFile: MODULE 17Bpython
-
-def invalidate_price_cache():
-    global _PRICE_CACHE
-    _PRICE_CACHE = {"price": None, "tokens": None, "ts": 0}
-
-# Called from /defaults when key in ("price_usd", "tokens_per_usd")
-
-PATCH 17 – Standalone Critical: /post loads all UIDs into memoryFile: MODULE 19python
-
-@app.on_message(filters.command("post") & filters.user(ADMIN_IDS))
-async def post_cmd(client, m: Message):
-    # ... parse msg ...
-    count = 0
+async def get_lifetime_balance(uid):
     async with SessionLocal() as db:
-        result = await db.stream(select(User.uid))
-        async for row in result:
-            uid = row[0]
-            await _safe_send(client, uid, msg)
-            count += 1
-            if count % 20 == 0:
-                await asyncio.sleep(0.1)
-    await _safe_send(client, m.chat.id, f"Posted to {count} users")
+        u = await db.get(User, uid)
+        if not u:
+            return 0
+        return u.tokens + u.lifetime_referral_tokens
 
-PATCH 18 – Standalone Critical: New-user + referral race in Gatekeeper (MODULE 12)After the simplified locking of PATCH 04, the /start handler acquires FOR UPDATE on the user row before token grant and referral assignment, all inside one transaction.PATCH 19 – Standalone Critical: Package activation race with Redis UID lock TTLFile: MODULE 24A (cb_buy_package / cb_select_premium)Inside the already-held Redis UID lock, an explicit re-check of can_buy is performed in the same transaction before activate_package.PATCH 20 – Standalone Critical: payment_version FSM finality (remaining edge from Groups 1/5)After all prior patches the only writers of payment_version are:create_invoice → insert version 1  
-boot janitor / webhook → 1→2 then 2→3 inside the same credit transaction  
-timeout path → mark dead with version 2
+async def _mutate_balance(
+    db: AsyncSession,
+    uid: int,
+    delta: int,
+    *,
+    payment_id: int | None = None,
+    reason: str = "payment",
+    extra_user_values: dict | None = None,
+) -> bool:
+    """
+    Single authority for every token change.
+    Holds User row FOR UPDATE, applies balance_version OCC once,
+    and (if payment_id given) finalizes the Payment row atomically.
+    """
+    now = datetime.now(timezone.utc)
+    extra_user_values = extra_user_values or {}
 
-No other code path mutates the column. DB constraints + the existing prevent_double_credit trigger remain the final safety net.
+    # Lock the user row
+    res = await db.execute(
+        select(User).where(User.uid == uid).with_for_update()
+    )
+    user = res.scalar_one_or_none()
 
+    if user is None:
+        if delta <= 0:
+            return False
+        # Create user on first credit
+        stmt = insert(User).values(
+            uid=uid,
+            tokens=delta,
+            balance_version=1,
+            **{k: v for k, v in extra_user_values.items() if k in User.__table__.columns}
+        )
+        result = await db.execute(stmt)
+        if result.rowcount != 1:
+            return False
+        user_created = True
+    else:
+        user_created = False
+        if user.tokens + delta < 0:
+            return False
+        expected = user.balance_version
+        values = {
+            "tokens": User.tokens + delta,
+            "balance_version": User.balance_version + 1,
+            **extra_user_values,
+        }
+        stmt = (
+            update(User)
+            .where(User.uid == uid, User.balance_version == expected)
+            .values(**values)
+        )
+        result = await db.execute(stmt)
+        if result.rowcount != 1:
+            return False
 
+    # Atomic payment finalization (only path that may set tokens_credited)
+    if payment_id is not None:
+        if reason not in ("admin", "recovery", "webhook"):
+            raise RuntimeError("Only recovery/webhook/admin may finalize payments")
+        stmt_p = (
+            update(Payment)
+            .where(
+                Payment.id == payment_id,
+                Payment.tokens_credited == False,
+                Payment.paid == False,
+            )
+            .values(
+                paid=True,
+                tokens_credited=True,
+                credited_at=now,
+                paid_at=now,
+                state="paid",
+                payment_version=3,          # final state only
+            )
+        )
+        res_p = await db.execute(stmt_p)
+        if res_p.rowcount != 1:
+            return False
 
+    return True
+async def add_tokens(
+    uid: int,
+    amount: int,
+    payment_id: int | None = None,
+    job_id: int | None = None,          # kept for signature compatibility
+    db: AsyncSession | None = None,
+    reason: str = "payment",
+) -> bool:
+    if amount <= 0:
+        return False
+    own = db is None
+    if own:
+        db = SessionLocal()
+    try:
+        for attempt in range(OCC_RETRIES):
+            try:
+                if own:
+                    async with db.begin():
+                        ok = await _mutate_balance(
+                            db, uid, amount,
+                            payment_id=payment_id,
+                            reason=reason,
+                        )
+                        if ok and payment_id is None and reason == "admin":
+                            # admin credit still records an audit Payment row
+                            now = datetime.now(timezone.utc)
+                            await db.execute(
+                                insert(Payment).values(
+                                    uid=uid,
+                                    amount_usd=0,
+                                    tokens=amount,
+                                    paid=True,
+                                    tokens_credited=True,
+                                    credited_at=now,
+                                    paid_at=now,
+                                    client_ref=f"admin_add_{uuid.uuid4().hex}",
+                                    state="paid",
+                                    payment_version=3,
+                                )
+                            )
+                        return ok
+                else:
+                    return await _mutate_balance(
+                        db, uid, amount,
+                        payment_id=payment_id,
+                        reason=reason,
+                    )
+            except DBAPIError as e:
+                if attempt == OCC_RETRIES - 1:
+                    raise
+                if getattr(getattr(e, "orig", None), "pgcode", None) == "40001":
+                    continue
+                raise
+        return False
+    finally:
+        if own:
+            await db.close()
+async def deduct_tokens(
+    uid: int,
+    amount: int,
+    idempotency_key: str | None = None,  # kept for signature
+    db: AsyncSession | None = None,
+) -> bool:
+    if amount <= 0:
+        return False
+    own = db is None
+    if own:
+        db = SessionLocal()
+    try:
+        for attempt in range(OCC_RETRIES):
+            try:
+                if own:
+                    async with db.begin():
+                        return await _mutate_balance(db, uid, -amount)
+                else:
+                    return await _mutate_balance(db, uid, -amount)
+            except DBAPIError as e:
+                if attempt == OCC_RETRIES - 1:
+                    raise
+                if getattr(getattr(e, "orig", None), "pgcode", None) == "40001":
+                    continue
+                raise
+        return False
+    finally:
+        if own:
+            await db.close()
+if __name__ != "__main__":
+    print("[MODULE 11 - TOKENS_ECONOMY] Loaded v1.0.64 (Root-Cause-1 mitigated)")
 
+2. MODULE 13 – PACKAGES (activate_package)Remove the nested UID-lock + extra FOR UPDATE + is_user_locked_for_buy call that created lock inversion. Use the single _mutate_balance path.python
+
+# Inside activate_package – replace the whole body of _activate_tx
+
+async def activate_package(uid, key, active_channel, db: AsyncSession = None):
+    own_db = db is None
+    if own_db:
+        db = SessionLocal()
+    p = PACKAGES[key]
+    cost = p["cost"]
+
+    try:
+        for attempt in range(OCC_RETRIES):
+            try:
+                async with db.begin():
+                    # Single lock point – User row
+                    res = await db.execute(
+                        select(User).where(User.uid == uid).with_for_update()
+                    )
+                    u = res.scalar_one_or_none()
+                    if not u:
+                        return False
+
+                    # Reject if any unpaid invoice still open (single query)
+                    pending = await db.execute(
+                        select(func.count()).select_from(Payment).where(
+                            Payment.uid == uid,
+                            Payment.paid == False,
+                            Payment.tokens_credited == False,
+                            Payment.state.in_(["reserving", "awaiting_payment", "open"]),
+                        )
+                    )
+                    if (pending.scalar() or 0) > 0:
+                        return False
+
+                    now = datetime.now(timezone.utc)
+                    if u.tokens < cost or u.active_channel is not None:
+                        return False
+
+                    # Atomic deduct + package activation
+                    ok = await _mutate_balance(
+                        db,
+                        uid,
+                        -cost,
+                        extra_user_values={
+                            "active_package": key,
+                            "active_channel": active_channel,
+                            "package_end": now + timedelta(seconds=p["internal"]),
+                        },
+                    )
+                    if ok:
+                        await add_expiring_user(uid, db)
+                    return ok
+            except DBAPIError as e:
+                if attempt == OCC_RETRIES - 1:
+                    raise
+                if getattr(getattr(e, "orig", None), "pgcode", None) == "40001":
+                    continue
+                raise
+        return False
+    finally:
+        if own_db:
+            await db.close()
+
+(Import _mutate_balance from modules.tokens.)3. MODULE 16 – REFERRAL_SYSTEM (credit_referral)Same pattern – drop UID lock, use single FOR UPDATE + _mutate_balance.python
+
+async def credit_referral(owner_id, new_user_id, db=None):
+    daily_cap, reward = await _get_ref_config()
+    own_db = db is None
+    if own_db:
+        db = SessionLocal()
+    try:
+        for attempt in range(OCC_RETRIES):
+            try:
+                async with db.begin():
+                    # Lock new user first (prevents double-credit race)
+                    u_new = await db.get(User, new_user_id, with_for_update=True)
+                    if not u_new or u_new.referred_by is not None:
+                        return False
+
+                    u_owner = await db.get(User, owner_id, with_for_update=True)
+                    if not u_owner or u_owner.referral_earned_today >= daily_cap:
+                        return False
+
+                    await db.execute(
+                        update(User)
+                        .where(User.uid == new_user_id)
+                        .values(referred_by=owner_id)
+                    )
+
+                    ok = await _mutate_balance(
+                        db,
+                        owner_id,
+                        reward,
+                        extra_user_values={
+                            "referral_earned_today": User.referral_earned_today + 1,
+                            "lifetime_referral_tokens": User.lifetime_referral_tokens + reward,
+                        },
+                    )
+                    return ok
+            except DBAPIError as e:
+                if attempt == OCC_RETRIES - 1:
+                    raise
+                if getattr(getattr(e, "orig", None), "pgcode", None) == "40001":
+                    continue
+                raise
+        return False
+    finally:
+        if own_db:
+            await db.close()
+
+4. MODULE 12 – GATEKEEPER (new-user + referral race)Create the user and credit the welcome tokens inside one transaction; set referred_by under the same lock.python
+
+# Inside gate_check – replace the user-creation block
+
+async with SessionLocal() as db:
+    async with db.begin():
+        u = await db.get(User, uid, with_for_update=True)
+        is_new = False
+        if not u:
+            is_new = True
+            tokens = await get_new_user_tokens(db=db)
+            # create + credit in one shot
+            await add_tokens(uid, tokens, db=db, reason="admin")
+            await db.execute(
+                update(User)
+                .where(User.uid == uid)
+                .values(is_verified_gate1=True)
+            )
+            u = await db.get(User, uid)
+
+        if is_new and m.text and m.text.startswith("/start ref_"):
+            try:
+                ref_id = int(m.text.split("ref_")[1])
+                if ref_id != uid:
+                    await db.execute(
+                        update(User)
+                        .where(
+                            User.uid == uid,
+                            User.referred_by.is_(None),
+                        )
+                        .values(referred_by=ref_id)
+                    )
+            except Exception:
+                pass
+
+5. Payment version FSM simplification (Modules 17B, 23, 26, 24B)create_invoice inserts with state='awaiting_payment', payment_version=1.
+Webhook / recovery / admin_finalize are the only writers that may move a row to state='open' then immediately call add_tokens(..., reason='recovery') which sets payment_version=3 and tokens_credited=True atomically.
+Remove every intermediate payment_version=2 mutation that was performed outside the final credit transaction.
+In recover_and_finalize_boot keep the existing three-phase scan, but the final credit step always goes through add_tokens(..., reason='recovery'). Any partial state left by a crash is therefore repaired on the next boot exactly as required by the rules.
+
+No other modules are touched. The Redis UID locks, the nested is_user_locked_for_buy FOR UPDATE, the multi-hop version FSM, and the partial-success OCC paths are gone. All remaining contention is resolved by the database; failures return False and are healed exclusively by the boot janitor.
+
+Explore PostgreSQL isolation levels
+
+Investigate Redis Lua scripting
+
+Refactor payment version logic
 
