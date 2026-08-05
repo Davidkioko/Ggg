@@ -2446,6 +2446,7 @@ PATCH 1.(apply to patch 13 only
              await db.close()
 
 PATCH 2
+
 ```diff
 --- a/modules/webhook_server.py
 +++ b/modules/webhook_server.py
@@ -2705,31 +2706,1007 @@ PATCH 2
                      )
 ```
 
+PATCH 3
 
-I WANT YOU TO CHECK IF BELOW BUG (OCC Retries Can Fail Silently or Partially)  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is patch 1 then patch 2) ON THE COMPILED MODULES
+--- a/modules/tokens.py
++++ b/modules/tokens.py
+@@ -XXX,XX +XXX,XX @@ async def _add_tokens_inner(
+     now = datetime.now(timezone.utc)
+     if payment_id is not None:
+         if reason not in ['admin', 'recovery']:
+             raise RuntimeError("Only MODULE 26 / webhook / admin can finalize payments")
+         stmt_lock_payment = select(Payment).where(Payment.id == payment_id).with_for_update()
+         result_lock_p = await db.execute(stmt_lock_payment)
+         payment = result_lock_p.scalar_one_or_none()
+         if payment is None:
+             raise RuntimeError(f"payment {payment_id} not found under FOR UPDATE")
+         if payment.tokens_credited:
+             return True
++        expected_pay_version = payment.payment_version
++        if expected_pay_version not in (1, 2):
++            raise RuntimeError(
++                f"payment {payment_id} has unexpected version {expected_pay_version}; "
++                "refusing partial credit"
++            )
+     for attempt in range(OCC_RETRIES):
+         if attempt == OCC_RETRIES - 1:
+             logger.warning("OCC contention: _add_tokens_inner final retry attempt=%s for uid=%s amount=%s", attempt, uid, amount)
+         res_user = await db.execute(select(User.balance_version).where(User.uid == uid).with_for_update())
+         row = res_user.first()
+         if row is None:
+             stmt_ins = insert(User).values(uid=uid, tokens=amount, balance_version=1)
+             result = await db.execute(stmt_ins)
+             if result.rowcount == 1:
+                 break
+             await asyncio.sleep(random.uniform(0.02 * (2 ** attempt), 0.06 * (2 ** attempt)))
+             continue
+         else:
+             expected_version = row[0]
+             stmt = (update(User).where(User.uid == uid, User.balance_version == expected_version).values(tokens=User.tokens + amount, balance_version=User.balance_version + 1))
+             result = await db.execute(stmt)
+             if result.rowcount == 1:
+                 break
+             await asyncio.sleep(random.uniform(0.02 * (2 ** attempt), 0.06 * (2 ** attempt)))
+     else:
+-        return False
++        raise RuntimeError(
++            f"OCC exhausted for uid={uid} amount={amount}; "
++            "rolling back any partial balance mutation"
++        )
+     if payment_id is not None:
+         values = {
+             "paid": True,
+             "tokens_credited": True,
+             "credited_at": now,
+             "paid_at": now,
+             "state": "paid",
+             "payment_version": 3,
+         }
+         if invoice_id is not None:
+             values["invoice_id"] = invoice_id
+         if payment_request is not None:
+             values["payment_request"] = payment_request
+         if expires_at is not None:
+             values["expires_at"] = expires_at
+         stmt_finalize = (
+             update(Payment)
+             .where(
+                 Payment.id == payment_id,
+                 Payment.tokens_credited == False,
+-                Payment.payment_version.in_([1, 2]),
++                Payment.payment_version == expected_pay_version,
+             )
+             .values(**values)
+         )
+         result = await db.execute(stmt_finalize)
+         if result.rowcount != 1:
+-            return False
++            raise RuntimeError(
++                f"payment finalization race for payment_id={payment_id} "
++                f"(expected_version={expected_pay_version}); "
++                "rolling back balance credit"
++            )
+     return True
 
-OCC Retries Can Fail Silently or Partially:
-•  Many for attempt in range(OCC_RETRIES) loops swallow exceptions or return False without rolling back cleanly. add_tokens_inner can succeed on user balance but fail on payment finalization.
+PATCH 4
+
+--- a/modules/gatekeeper.py
++++ b/modules/gatekeeper.py
+@@ -1,6 +1,7 @@
+ from pyrogram import filters
+ from core.bot import app, tg_semaphore
+ from db.db import SessionLocal
+ from db.models import User, Setting
+-from modules.tokens import add_tokens, get_balance
++from modules.tokens import add_tokens, get_balance, _get_uid_lock, _add_tokens_inner
+ from modules.menus import main_menu
+ from modules.constants import get_gif
+ from modules.tg_api import batch_delete_messages, send_message
+ from config import ADMIN_IDS, NEW_USER_TOKENS
+ import config
+ from sqlalchemy import select, update
+ import json
+ import asyncio
+ import time
+ 
+@@ -80,30 +81,48 @@ async def gate_check(client, m):
+     if config.SYSTEM_LOCKED:
+         await send_message(client, m.chat.id, "Bot is starting, please wait")
+         return
+     uid = m.from_user.id
+     passed_gate = await check_gate(client, uid)
+     async with SessionLocal() as db:
+         async with db.begin():
++            # Same lock order as add_tokens / activate_package / credit_referral
++            # (SERIALIZABLE → asyncio UID lock → FOR UPDATE). Closes the
++            # check-then-act race on new-user creation + referred_by.
++            await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
++            uid_lock = await _get_uid_lock(uid)
++            async with uid_lock:
++                res = await db.execute(
++                    select(User).where(User.uid == uid).with_for_update()
++                )
++                u = res.scalar_one_or_none()
+                 is_new = False
+-                if not u:
++                if u is None:
+                     is_new = True
+                     tokens = await get_new_user_tokens(db=db)
+-                    await add_tokens(uid, tokens, db=db)
++                    # Call the already-patched inner under the lock we hold.
++                    # (Public add_tokens with db= no longer takes the lock
++                    # after Patch 2; we supply it here.)
++                    await _add_tokens_inner(uid, tokens, db=db, reason='admin')
+                     await db.execute(
+                         update(User)
+                         .where(User.uid == uid)
+                         .values(is_verified_gate1=True)
+                     )
+                     u = await db.get(User, uid)
+-                if is_new and m.text and m.text.startswith("/start ref_"):
++                # Always attempt referred_by under the same lock if still NULL.
++                # (Keeps the original “only on first creation” intent while
++                # eliminating the lost-ref race against a concurrent non-ref
++                # /start that won the creation slot.)
++                if m.text and m.text.startswith("/start ref_"):
+                     try:
+                         ref_id = int(m.text.split("ref_")[1])
+                         if ref_id != uid:
+                             await db.execute(
+                                 update(User)
+                                 .where(
+                                     User.uid == uid,
+                                     User.referred_by.is_(None)
+                                 )
+                                 .values(referred_by=ref_id)
+                             )
+                     except Exception:
+                         pass
+                 if not passed_gate:
+                     await _vanish_menus(client, uid, db=db)
+
+
+PATCH 5
+
+--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -280,90 +280,78 @@ async def recover_and_finalize_boot(db: AsyncSession):
+     # ------------------------------------------------------------------
+     # BOOT JANITOR – sole authority that may force intermediate states
+     # into a terminal state after a full outage. No runtime cron.
+     #
+     # payment_version=3 is the universal terminal marker:
+     # - state='paid' + tokens_credited=True → success path
+     # - state='dead' → timed-out unpaid
+     # No other code path may write version=3.
+     # ------------------------------------------------------------------
+     async with SessionLocal() as phase_db:
+         async with phase_db.begin():
+             await phase_db.execute(text(
+                 "UPDATE users SET invoice_lock_until=NULL "
+                 "WHERE invoice_lock_until < now()"
+             ))
+ 
+-    # Phase 1 – attach invoice_id if Alby already has it (still version=1)
+-    candidates_p1 = []
+-    async with SessionLocal() as phase_db:
+-        async with phase_db.begin():
+-            res = await phase_db.execute(
+-                select(Payment)
+-                .where(
+-                    Payment.state == 'awaiting_payment',
+-                    Payment.invoice_id.is_(None),
+-                    Payment.payment_version == 1,
+-                )
+-                .with_for_update()
+-            )
+-            candidates_p1 = list(res.scalars())
+-    alby_results_p1 = {}
+-    for p in candidates_p1:
+-        try:
+-            alby_results_p1[p.id] = await alby_is_paid_by_ref(p.client_ref)
+-        except Exception:
+-            alby_results_p1[p.id] = None
+-    async with SessionLocal() as phase_db:
+-        async with phase_db.begin():
+-            for p in candidates_p1:
+-                data = alby_results_p1.get(p.id)
+-                if data is not None and (
+-                    data.get("state") == "settled" or data.get("paid") is True
+-                ):
+-                    await phase_db.execute(
+-                        update(Payment)
+-                        .where(
+-                            Payment.id == p.id,
+-                            Payment.payment_version == 1,
+-                            Payment.invoice_id.is_(None),
+-                        )
+-                        .values(
+-                            invoice_id=data.get("id"),
+-                            payment_request=data.get("payment_request"),
+-                            expires_at=data.get("expires_at"),
+-                            # stay at version=1; finalizer below will
+-                            # jump straight to 3 if still unpaid
+-                        )
+-                    )
+-
+-    # Phase 2 – force terminal state for every non-terminal row
+-    candidates = []
+-    async with SessionLocal() as phase_db:
+-        async with phase_db.begin():
+-            res = await phase_db.execute(
+-                select(Payment)
+-                .where(
+-                    Payment.tokens_credited == False,
+-                    Payment.payment_version.in_([1, 2]),
+-                    Payment.state.in_(['reserving', 'awaiting_payment', 'open']),
+-                )
+-                .with_for_update()
+-            )
+-            candidates = list(res.scalars())
+-    for p in candidates:
+-        paid_on_alby = False
+-        try:
+-            if p.invoice_id:
+-                paid_on_alby = await alby_is_paid(p.invoice_id) is True
+-            else:
+-                data = await alby_is_paid_by_ref(p.client_ref)
+-                paid_on_alby = bool(
+-                    data and (data.get("state") in ('settled', 'paid')
+-                              or data.get("paid") is True)
+-                )
+-        except Exception:
+-            paid_on_alby = False
+-        async with SessionLocal() as phase_db:
+-            async with phase_db.begin():
+-                if paid_on_alby:
+-                    # Atomic credit – jumps whatever version we have
+-                    # straight to 3. Phase 1 already attached invoice_*
+-                    # when possible; no need to pass them here.
+-                    await add_tokens(
+-                        p.uid, p.tokens,
+-                        payment_id=p.id, reason='recovery', db=phase_db
+-                    )
+-                else:
+-                    # Timed-out unpaid → dead (terminal, version=3)
+-                    await phase_db.execute(
+-                        update(Payment)
+-                        .where(
+-                            Payment.id == p.id,
+-                            Payment.payment_version.in_([1, 2]),
+-                            Payment.tokens_credited == False,
+-                            Payment.created < func.now() - text(
+-                                f"interval '{RESERVING_TIMEOUT_SEC} seconds'"
+-                            ),
+-                        )
+-                        .values(state='dead', payment_version=3)
+-                    )
++    # Single atomic pass: lock every non-terminal row, decide under the
++    # lock, never release until the row is version=3 (or left alone).
++    # Alby calls happen while FOR UPDATE is held, eliminating the
++    # window that previously allowed a concurrent webhook to claim the
++    # same payment.
++    async with SessionLocal() as phase_db:
++        async with phase_db.begin():
++            await phase_db.execute(
++                select(1).execution_options(isolation_level="SERIALIZABLE")
++            )
++            res = await phase_db.execute(
++                select(Payment)
++                .where(
++                    Payment.tokens_credited == False,
++                    Payment.payment_version.in_([1, 2]),
++                    Payment.state.in_(['reserving', 'awaiting_payment', 'open']),
++                )
++                .with_for_update()
++            )
++            candidates = list(res.scalars())
++
++            for p in candidates:
++                paid_on_alby = False
++                invoice_id = p.invoice_id
++                payment_request = p.payment_request
++                expires_at = p.expires_at
++                try:
++                    if invoice_id:
++                        paid_on_alby = await alby_is_paid(invoice_id) is True
++                    else:
++                        data = await alby_is_paid_by_ref(p.client_ref)
++                        if data is not None:
++                            invoice_id = data.get("id") or invoice_id
++                            payment_request = data.get("payment_request") or payment_request
++                            expires_at = data.get("expires_at") or expires_at
++                            paid_on_alby = bool(
++                                data.get("state") in ('settled', 'paid')
++                                or data.get("paid") is True
++                            )
++                except Exception:
++                    paid_on_alby = False
++
++                if paid_on_alby:
++                    # Atomic 1|2 → 3 under the lock we already hold.
++                    # add_tokens (post-Patch-2/3) will refuse any version
++                    # that is no longer 1 or 2, so a concurrent webhook
++                    # that snuck in before our SELECT is harmless.
++                    await add_tokens(
++                        p.uid, p.tokens,
++                        payment_id=p.id,
++                        reason='recovery',
++                        db=phase_db,
++                        invoice_id=invoice_id,
++                        payment_request=payment_request,
++                        expires_at=expires_at,
++                    )
++                else:
++                    # Timed-out unpaid → dead (terminal, version=3)
++                    await phase_db.execute(
++                        update(Payment)
++                        .where(
++                            Payment.id == p.id,
++                            Payment.payment_version.in_([1, 2]),
++                            Payment.tokens_credited == False,
++                            Payment.created < func.now() - text(
++                                f"interval '{RESERVING_TIMEOUT_SEC} seconds'"
++                            ),
++                        )
++                        .values(state='dead', payment_version=3)
++                    )
+
+PATCH 6
+--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -XXX,XX +XXX,XX @@ async def recover_and_finalize_boot(db: AsyncSession):
+                 if paid_on_alby:
+                     # Atomic 1|2 → 3 under the lock we already hold.
+                     # add_tokens (post-Patch-2/3) will refuse any version
+                     # that is no longer 1 or 2, so a concurrent webhook
+                     # that snuck in before our SELECT is harmless.
+                     await add_tokens(
+                         p.uid, p.tokens,
+                         payment_id=p.id,
+                         reason='recovery',
+                         db=phase_db,
+                         invoice_id=invoice_id,
+                         payment_request=payment_request,
+                         expires_at=expires_at,
+                     )
+                 else:
+-                    # Timed-out unpaid → dead (terminal, version=3)
+-                    await phase_db.execute(
+-                        update(Payment)
+-                        .where(
+-                            Payment.id == p.id,
+-                            Payment.payment_version.in_([1, 2]),
+-                            Payment.tokens_credited == False,
+-                            Payment.created < func.now() - text(
+-                                f"interval '{RESERVING_TIMEOUT_SEC} seconds'"
+-                            ),
+-                        )
+-                        .values(state='dead', payment_version=3)
+-                    )
++                    # Force terminal state for every non-terminal row when
++                    # Alby is unreachable or reports unpaid.
++                    # This is the only place that may write version=3 on the
++                    # unpaid path; live paths never do.
++                    await phase_db.execute(
++                        update(Payment)
++                        .where(
++                            Payment.id == p.id,
++                            Payment.payment_version.in_([1, 2]),
++                            Payment.tokens_credited == False,
++                        )
++                        .values(state='dead', payment_version=3)
++                    )
+
+
+PATCH 7
+
+--- a/modules/entry.py
++++ b/modules/entry.py
+@@ -XX,XX +XX,XX @@ async def main():
+     r = redis.Redis(host=REDIS_HOST, decode_responses=True)
+     await r.set(BOOT_LOCK_KEY, "1", ex=RECOVERY_MAX_RUNTIME_SEC)
+     try:
+         async with SessionLocal() as db:
+             await recover_and_finalize_boot(db)
+             await db.commit()
++        # Delete only after the boot janitor has completed without error.
++        # On any exception the key is left until TTL; process will exit and
++        # the next full restart re-runs recovery under a fresh lock.
++        await r.delete(BOOT_LOCK_KEY)
+     finally:
+-        await r.delete(BOOT_LOCK_KEY)
+         await r.close()
+     config.SYSTEM_LOCKED = False
+
+PATCH 8
+
+--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -XXX,XX +XXX,XX @@ async def recover_and_finalize_boot(db: AsyncSession):
+             candidates = list(res.scalars())
+ 
+             for p in candidates:
++                # Capture the exact version we observed under FOR UPDATE.
++                # All terminal writes below must use this expected value
++                # so the 1/2 → 3 guard is applied uniformly on every
++                # recovery path (credit and dead).
++                expected_version = p.payment_version
++                if expected_version not in (1, 2):
++                    # Already terminal or unexpected; leave alone.
++                    continue
++
+                 paid_on_alby = False
+                 invoice_id = p.invoice_id
+                 payment_request = p.payment_request
+                 expires_at = p.expires_at
+                 try:
+                     if invoice_id:
+                         paid_on_alby = await alby_is_paid(invoice_id) is True
+                     else:
+                         data = await alby_is_paid_by_ref(p.client_ref)
+                         if data is not None:
+                             invoice_id = data.get("id") or invoice_id
+                             payment_request = data.get("payment_request") or payment_request
+                             expires_at = data.get("expires_at") or expires_at
+                             paid_on_alby = bool(
+                                 data.get("state") in ('settled', 'paid')
+                                 or data.get("paid") is True
+                             )
+                 except Exception:
+                     paid_on_alby = False
+ 
+                 if paid_on_alby:
+                     # Atomic 1|2 → 3 under the lock we already hold.
+                     # Pass the captured expected_version so the finalizer
+                     # inside add_tokens/_add_tokens_inner uses exactly
+                     # the same guard the dead path uses.
+                     await add_tokens(
+                         p.uid, p.tokens,
+                         payment_id=p.id,
+                         reason='recovery',
+                         db=phase_db,
+                         invoice_id=invoice_id,
+                         payment_request=payment_request,
+                         expires_at=expires_at,
++                        # The public signature already accepts the
++                        # keyword-only Alby fields; the inner
++                        # finalizer (post-Patch 3) will re-check
++                        # against the version it sees under its
++                        # own FOR UPDATE.  By having captured
++                        # expected_version here we make the
++                        # decision and the write consistent.
+                     )
+                 else:
+                     # Force terminal state for every non-terminal row when
+                     # Alby is unreachable or reports unpaid.
+                     # This is the only place that may write version=3 on the
+                     # unpaid path; live paths never do.
+                     # Use the exact version observed under FOR UPDATE.
+                     await phase_db.execute(
+                         update(Payment)
+                         .where(
+                             Payment.id == p.id,
+-                            Payment.payment_version.in_([1, 2]),
++                            Payment.payment_version == expected_version,
+                             Payment.tokens_credited == False,
+                         )
+                         .values(state='dead', payment_version=3)
+                     )
+
+
+PATCH 9
+
+--- a/modules/tokens.py
++++ b/modules/tokens.py
+@@ -XX,XX +XX,XX @@ async def _add_tokens_inner(
+     now = datetime.now(timezone.utc)
+     if payment_id is not None:
+         if reason not in ['admin', 'recovery']:
+             raise RuntimeError("Only MODULE 26 / webhook / admin can finalize payments")
+         stmt_lock_payment = select(Payment).where(Payment.id == payment_id).with_for_update()
+         result_lock_p = await db.execute(stmt_lock_payment)
+         payment = result_lock_p.scalar_one_or_none()
+         if payment is None:
+             raise RuntimeError(f"payment {payment_id} not found under FOR UPDATE")
+         if payment.tokens_credited:
+             return True
+         expected_pay_version = payment.payment_version
+         if expected_pay_version not in (1, 2):
+             raise RuntimeError(
+                 f"payment {payment_id} has unexpected version {expected_pay_version}; "
+                 "refusing partial credit"
+             )
++        # Exclusive claim BEFORE any User balance mutation.
++        # Turns “credit + terminal write” into a single atomic unit
++        # that no concurrent independent session can interleave.
++        # Version is left unchanged so a crash mid-claim leaves the
++        # row still in {1,2} and recoverable by the boot janitor.
++        claim = await db.execute(
++            update(Payment)
++            .where(
++                Payment.id == payment_id,
++                Payment.tokens_credited == False,
++                Payment.payment_version == expected_pay_version,
++                Payment.alby_state != "claiming",
++            )
++            .values(alby_state="claiming")
++        )
++        if claim.rowcount != 1:
++            raise RuntimeError(
++                f"payment claim race for payment_id={payment_id} "
++                f"(expected_version={expected_pay_version}); "
++                "another finalizer already owns this row"
++            )
+     for attempt in range(OCC_RETRIES):
+         # … existing User balance OCC loop unchanged …
+     else:
+         raise RuntimeError(
+             f"OCC exhausted for uid={uid} amount={amount}; "
+             "rolling back any partial balance mutation"
+         )
+     if payment_id is not None:
+         values = {
+             "paid": True,
+             "tokens_credited": True,
+             "credited_at": now,
+             "paid_at": now,
+             "state": "paid",
+             "payment_version": 3,
++            "alby_state": "settled",
+         }
+         if invoice_id is not None:
+             values["invoice_id"] = invoice_id
+         if payment_request is not None:
+             values["payment_request"] = payment_request
+         if expires_at is not None:
+             values["expires_at"] = expires_at
+         stmt_finalize = (
+             update(Payment)
+             .where(
+                 Payment.id == payment_id,
+                 Payment.tokens_credited == False,
+                 Payment.payment_version == expected_pay_version,
++                Payment.alby_state == "claiming",
+             )
+             .values(**values)
+         )
+         result = await db.execute(stmt_finalize)
+         if result.rowcount != 1:
+             raise RuntimeError(
+                 f"payment finalization race for payment_id={payment_id} "
+                 f"(expected_version={expected_pay_version}); "
+                 "rolling back balance credit"
+             )
+     return True
+
+--- a/modules/tokens.py
++++ b/modules/tokens.py
+@@ -XX,XX +XX,XX @@ async def _add_tokens_inner(
+     now = datetime.now(timezone.utc)
+     if payment_id is not None:
+         if reason not in ['admin', 'recovery']:
+             raise RuntimeError("Only MODULE 26 / webhook / admin can finalize payments")
+         stmt_lock_payment = select(Payment).where(Payment.id == payment_id).with_for_update()
+         result_lock_p = await db.execute(stmt_lock_payment)
+         payment = result_lock_p.scalar_one_or_none()
+         if payment is None:
+             raise RuntimeError(f"payment {payment_id} not found under FOR UPDATE")
+         if payment.tokens_credited:
+             return True
+         expected_pay_version = payment.payment_version
+-        if expected_pay_version not in (1, 2):
++        if expected_pay_version not in (1, 2, 4):
+             raise RuntimeError(
+                 f"payment {payment_id} has unexpected version {expected_pay_version}; "
+                 "refusing partial credit"
+             )
+-        # True exclusive claim: move to a non-credit-eligible version
+-        # *before* any User balance mutation. payment_version=4 is a
+-        # transient “claimed-by-finalizer” marker that is never written
+-        # by any other path. A crash after this statement leaves the
+-        # row at version=4; the boot janitor (sole recovery authority)
+-        # treats version=4 exactly like {1,2} and will either credit or
+-        # mark dead. No live path can ever observe version=4 and
+-        # attempt a second credit.
+-        claim = await db.execute(
+-            update(Payment)
+-            .where(
+-                Payment.id == payment_id,
+-                Payment.tokens_credited == False,
+-                Payment.payment_version == expected_pay_version,
+-            )
+-            .values(
+-                payment_version=4, # exclusive claim marker
+-                alby_state="claiming",
+-            )
+-        )
+-        if claim.rowcount != 1:
+-            raise RuntimeError(
+-                f"payment claim race for payment_id={payment_id} "
+-                f"(expected_version={expected_pay_version}); "
+-                "another finalizer already owns this row"
+-            )
+-        # From this point the row is invisible to every other finalizer
+-        # (version no longer in {1,2}). Balance mutation + terminal
+-        # write are now single-writer.
++        # True exclusive claim.  Version 4 is the transient
++        # “claimed-by-finalizer” marker.  A live path that sees 1 or 2
++        # moves the row to 4 before any balance mutation.  A recovery
++        # path that already sees 4 (crash after previous claim) treats
++        # the row as already claimed and proceeds directly to the
++        # balance + terminal write.  No other code path ever writes 4.
++        if expected_pay_version in (1, 2):
++            claim = await db.execute(
++                update(Payment)
++                .where(
++                    Payment.id == payment_id,
++                    Payment.tokens_credited == False,
++                    Payment.payment_version == expected_pay_version,
++                )
++                .values(
++                    payment_version=4,
++                    alby_state="claiming",
++                )
++            )
++            if claim.rowcount != 1:
++                raise RuntimeError(
++                    f"payment claim race for payment_id={payment_id} "
++                    f"(expected_version={expected_pay_version}); "
++                    "another finalizer already owns this row"
++                )
++        # From this point the row is version 4 and invisible to every
++        # other finalizer.  Balance mutation + terminal write are
++        # single-writer.
+     for attempt in range(OCC_RETRIES):
+         # … existing User balance OCC loop unchanged …
+     else:
+         raise RuntimeError(
+             f"OCC exhausted for uid={uid} amount={amount}; "
+             "rolling back any partial balance mutation"
+         )
+     if payment_id is not None:
+         values = {
+             "paid": True,
+             "tokens_credited": True,
+             "credited_at": now,
+             "paid_at": now,
+             "state": "paid",
+             "payment_version": 3,
+             "alby_state": "settled",
+         }
+         if invoice_id is not None:
+             values["invoice_id"] = invoice_id
+         if payment_request is not None:
+             values["payment_request"] = payment_request
+         if expires_at is not None:
+             values["expires_at"] = expires_at
+         stmt_finalize = (
+             update(Payment)
+             .where(
+                 Payment.id == payment_id,
+                 Payment.tokens_credited == False,
+                 Payment.payment_version == 4,
+                 Payment.alby_state == "claiming",
+             )
+             .values(**values)
+         )
+         result = await db.execute(stmt_finalize)
+         if result.rowcount != 1:
+             raise RuntimeError(
+                 f"payment finalization race for payment_id={payment_id} "
+                 f"(expected_version=4); "
+                 "rolling back balance credit"
+             )
+     return True
+--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -XXX,XX +XXX,XX @@ async def recover_and_finalize_boot(db: AsyncSession):
+             res = await phase_db.execute(
+                 select(Payment)
+                 .where(
+                     Payment.tokens_credited == False,
+-                    Payment.payment_version.in_([1, 2]),
++                    Payment.payment_version.in_([1, 2, 4]),
+                     Payment.state.in_(['reserving', 'awaiting_payment', 'open']),
+                 )
+                 .with_for_update()
+             )
+             candidates = list(res.scalars())
+ 
+             for p in candidates:
+                 expected_version = p.payment_version
+-                if expected_version not in (1, 2):
++                if expected_version not in (1, 2, 4):
+                     continue
+ 
+                 paid_on_alby = False
+                 invoice_id = p.invoice_id
+                 payment_request = p.payment_request
+                 expires_at = p.expires_at
+                 try:
+                     if invoice_id:
+                         paid_on_alby = await alby_is_paid(invoice_id) is True
+                     else:
+                         data = await alby_is_paid_by_ref(p.client_ref)
+                         if data is not None:
+                             invoice_id = data.get("id") or invoice_id
+                             payment_request = data.get("payment_request") or payment_request
+                             expires_at = data.get("expires_at") or expires_at
+                             paid_on_alby = bool(
+                                 data.get("state") in ('settled', 'paid')
+                                 or data.get("paid") is True
+                             )
+                 except Exception:
+                     paid_on_alby = False
+ 
+                 if paid_on_alby:
+                     await add_tokens(
+                         p.uid, p.tokens,
+                         payment_id=p.id,
+                         reason='recovery',
+                         db=phase_db,
+                         invoice_id=invoice_id,
+                         payment_request=payment_request,
+                         expires_at=expires_at,
+                     )
+                 else:
+                     await phase_db.execute(
+                         update(Payment)
+                         .where(
+                             Payment.id == p.id,
+-                            Payment.payment_version == expected_version,
++                            Payment.payment_version.in_([1, 2, 4]),
+                             Payment.tokens_credited == False,
+                         )
+                         .values(state='dead', payment_version=3)
+                     )
+
+
+PATCH 11
+
+--- a/modules/payments_api.py
++++ b/modules/payments_api.py
+@@ -XX,XX +XX,XX @@ async def create_invoice(uid: int) -> tuple[str, str, int, float, int]:
+     price_usd, tokens_per_usd = await _get_price_config()
+     amount_usd = price_usd
+     client_ref = str(uuid.uuid4())
+     now = datetime.now(timezone.utc)
+     async with SessionLocal() as db:
+         async with db.begin():
+             await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
+             res = await db.execute(
+                 select(Payment)
+                 .where(
+                     Payment.uid == uid,
+                     Payment.paid == False,
+                     Payment.tokens_credited == False,
+                     Payment.state.in_(["reserving", "awaiting_payment", "open"]),
+                 )
+                 .with_for_update()
+             )
+             existing = res.scalar_one_or_none()
+             if existing:
+                 if existing.payment_request and existing.invoice_id:
+                     return (
+                         existing.payment_request,
+                         existing.invoice_id,
+                         existing.id,
+                         float(existing.amount_usd),
+                         existing.tokens,
+                     )
+                 # Incomplete reservation already held by a concurrent
+                 # create_invoice (or a crashed previous attempt).  Force
+                 # the caller’s retry_with_jitter to back off; the holder
+                 # will either finish the Alby attach or the boot janitor
+                 # will terminalise the row on the next full restart.
+                 raise RuntimeError(
+                     "Incomplete unpaid invoice already exists for this uid; "
+                     "retry after concurrent finalizer completes"
+                 )
+             try:
+                 stmt_ins = (
+                     insert(Payment)
+                     .values(
+                         uid=uid,
+                         paid=False,
+                         amount_usd=amount_usd,
+                         tokens=tokens_per_usd,
+                         client_ref=client_ref,
+                         created=now,
+                         state="awaiting_payment",
+                         invoice_id=None,
+                         payment_request=None,
+                         expires_at=None,
+                         payment_version=1,
+                     )
+                     .returning(Payment.id)
+                 )
+                 res = await db.execute(stmt_ins)
+                 pay_id = res.scalar_one()
+             except IntegrityError:
+                 # Unique constraint fired: another concurrent insert won
+                 # the single-flight slot.  Re-read under the same
+                 # SERIALIZABLE + FOR UPDATE so we see a consistent snapshot.
+                 res = await db.execute(
+                     select(Payment)
+                     .where(
+                         Payment.uid == uid,
+                         Payment.paid == False,
+                         Payment.tokens_credited == False,
+                         Payment.state.in_(["reserving", "awaiting_payment", "open"]),
+                     )
+                     .with_for_update()
+                 )
+                 existing = res.scalar_one_or_none()
+                 if existing and existing.payment_request and existing.invoice_id:
+                     return (
+                         existing.payment_request,
+                         existing.invoice_id,
+                         existing.id,
+                         float(existing.amount_usd),
+                         existing.tokens,
+                     )
+                 # Still incomplete (winner has not yet attached Alby
+                 # fields) or the row vanished.  Raise so the caller’s
+                 # retry_with_jitter backs off; never create a second
+                 # invoice.  Boot janitor remains the sole authority for
+                 # any permanently stuck version=1 reservation.
+                 raise RuntimeError(
+                     "Failed to insert payment – unique constraint; "
+                     "concurrent incomplete reservation in flight"
+                 )
+     # Alby call and subsequent attach remain outside the reservation
+     # transaction exactly as before; the unique + SERIALIZABLE + the
+     # expanded IntegrityError path now guarantee that only one live
+     # path can ever hold the version=1 slot for a given uid.
+     s = await get_http()
+     async with alby_semaphore:
+         r = await s.post(
+             "https://api.getalby.com/invoices",
+             headers={
+                 "Authorization": f"Bearer {ALBY_TOKEN}",
+                 "X-Idempotency-Key": client_ref,
+             },
+             json={
+                 "amount": amount_usd,
+                 "metadata": {
+                     "uid": uid,
+                     "tokens": tokens_per_usd,
+                     "client_ref": client_ref,
+                 },
+             },
+         )
+         if r.status >= 400:
+             raise RuntimeError(f"Alby invoice creation failed status {r.status}")
+         data = await r.json()
+     async with SessionLocal() as db:
+         async with db.begin():
+             result = await db.execute(
+                 update(Payment)
+                 .where(
+                     Payment.id == pay_id,
+                     Payment.payment_version == 1,
+                     Payment.invoice_id.is_(None),
+                 )
+                 .values(
+                     invoice_id=data["id"],
+                     payment_request=data["payment_request"],
+                     expires_at=data.get("expires_at"),
+                     payment_version=1,
+                 )
+             )
+             if result.rowcount != 1:
+                 row = await db.get(Payment, pay_id)
+                 if row and row.invoice_id and row.payment_request:
+                     return (
+                         row.payment_request,
+                         row.invoice_id,
+                         pay_id,
+                         amount_usd,
+                         tokens_per_usd,
+                     )
+                 raise RuntimeError("Failed to attach Alby invoice to payment row")
+     return (
+         data["payment_request"],
+         data["id"],
+         pay_id,
+         amount_usd,
+         tokens_per_usd,
+     )
+
+PATCH 12
+
+--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -XXX,XX +XXX,XX @@ async def recover_and_finalize_boot(db: AsyncSession):
+             for p in candidates:
+                 expected_version = p.payment_version
+                 if expected_version not in (1, 2, 4):
+                     continue
+ 
+-                paid_on_alby = False
++                # Three-way outcome required by Alby best-effort contract:
++                #   True  → paid   → credit (version 3)
++                #   False → unpaid → dead   (version 3)  only after reservation window
++                #   None  → network / unknown → leave non-terminal for next boot
++                paid_on_alby = None
+                 invoice_id = p.invoice_id
+                 payment_request = p.payment_request
+                 expires_at = p.expires_at
+                 try:
+                     if invoice_id:
+-                        paid_on_alby = await alby_is_paid(invoice_id) is True
++                        result = await alby_is_paid(invoice_id)
++                        if result is True:
++                            paid_on_alby = True
++                        elif result is False:
++                            paid_on_alby = False
++                        # else None → leave paid_on_alby = None
+                     else:
+                         data = await alby_is_paid_by_ref(p.client_ref)
+                         if data is not None:
+                             invoice_id = data.get("id") or invoice_id
+                             payment_request = data.get("payment_request") or payment_request
+                             expires_at = data.get("expires_at") or expires_at
+                             paid_on_alby = bool(
+                                 data.get("state") in ('settled', 'paid')
+                                 or data.get("paid") is True
+                             )
++                        # data is None → network error; leave paid_on_alby = None
+                 except Exception:
+-                    paid_on_alby = False
++                    paid_on_alby = None
+ 
+-                if paid_on_alby:
++                if paid_on_alby is True:
+                     await add_tokens(
+                         p.uid, p.tokens,
+                         payment_id=p.id,
+                         reason='recovery',
+                         db=phase_db,
+                         invoice_id=invoice_id,
+                         payment_request=payment_request,
+                         expires_at=expires_at,
+                     )
+-                else:
++                elif paid_on_alby is False:
+                     await phase_db.execute(
+                         update(Payment)
+                         .where(
+                             Payment.id == p.id,
+                             Payment.payment_version.in_([1, 2, 4]),
+                             Payment.tokens_credited == False,
++                            Payment.created < func.now() - text(
++                                f"interval '{RESERVING_TIMEOUT_SEC} seconds'"
++                            ),
+                         )
+                         .values(state='dead', payment_version=3)
+                     )
++                # paid_on_alby is None → do nothing; row stays in {1,2,4}
++                # so the next full restart can re-query Alby.
+
+
+I WANT YOU TO CHECK IF BELOW BUG ( Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error )  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is sequentially patch 1 then patch 2,then patch 3, then patch 4, then patch 5, then patch 6, then patch 7,then PATCH 8,then PATCH 9,then patch 10,then patch 11,then patch 12) ON THE COMPILED MODULES
+
+ Alby Reconciliation is Best-Effort:
+    * Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error → stuck payments.
 
 WARNING!!THIS IS A DRY RUN, SPECULATIVE EXECUTION, PREFLIGHT VALIDATION, WE ARE TESTING THE PATCH BELOW  IF IT WILL APPLY CLEANLY TO CODEBASE WITHOUT MODIFYING ACTIVE PROJECT FILES. MY COMPILED CODE HAS NOT BEEN PATCHED YET, THE PATCH IS A SUGESTION OF WHAT I SHOULD DO
 
-IF THE BUG (OCC Retries Can Fail Silently or Partially) EXISTS:
+IF THE BUG (Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error) EXISTS:
 
-DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW CHECK MITIGATION PATCH  BELOW IF IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
-1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1 THEN PATCH 2)TO THE EXISTING COMPILED MODULE.
-2.IT SHOULD CLOSE THE (OCC Retries Can Fail Silently or Partially) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
-3.IT SHOULD ONLY ALTER CODE THAT  (OCC Retries Can Fail Silently or Partially) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
+DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND PROVIDE A MITIGATION PATCH THAT IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
+1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12 )TO THE EXISTING COMPILED MODULE.
+2.IT SHOULD CLOSE THE ( Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
+3.IT SHOULD ONLY ALTER CODE THAT  ( Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
 4.NO RUNTIME CRONS/CLEANERS/PERIODIC SCHEDULER ONLY ONE BOOT JANITOR THAT CAN RECOVER THE SYSYEM IN WHATEVER STATE IT WAS BEFORE FULL BOT OUTAGE
 5.LET THE SYTEM HANDLE ITSELF IF THERE IS A TIMEOUT, ERROR, CRASH 
 6.IF A PROCESS CANT HANDLE ITSELF DURING UPTIME THEN IT SHOULD BE HANDLED BY BOOT RWECOVERY DURING A FULL BOT RESTART
-7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE (OCC Retries Can Fail Silently or Partially) bug (if it exists) NO OTHER CASES
-    
+7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE (Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error  ) bug (if it exists) NO OTHER CASES
+
+WARNING!! DO NOT RESEND THE PATCH IF ALL 7 RULES ARE FOLLOWED AND THERE IS LITERALLY ZERO CODE CHANGE FROM WHAT I HAVE BELOW
                    
-IF THE PATCH BELOW DOES NOT FOLLOW ALL 6 RULES  TELL ME EXACTLY WHAT RULE HAS BEEN BROKEN, STATE THE EXACT CODE FROM THE WHOLE PATCH ABOVE AND WHAT NEEDS TO CHANGE FROM WHOLE PATCH , THEN UPDATE IT AND RESEND THE PATCH,DO NOT USE PLACEHOLDERS LIKE "KEEP PREVIOUS PATCH SUGGESTION"AND DO NOT PUT REFERENCE TO OLD CODE FROM THE OLD PATCH THAT I DISCARDED ENTIRELY.AND AFTER GENERATING NEW PATCH STATE EXACTLY WHAT HAS CHANGED FROM PREVIOUS PATCH ABOVE
+IF THE PATCH BELOW DOES NOT FOLLOW ALL 7 RULES  TELL ME EXACTLY WHAT RULE HAS BEEN BROKEN, STATE THE EXACT CODE FROM THE PATCH BELOW AND WHAT NEEDS TO CHANGE FROM THE PATCH BELOW , THEN UPDATE IT AND RESEND THE PATCH,DO NOT USE PLACEHOLDERS LIKE "KEEP PREVIOUS PATCH SUGGESTION"AND DO NOT PUT REFERENCE TO OLD CODE FROM THE OLD PATCH THAT I DISCARDED ENTIRELY.AND AFTER GENERATING NEW PATCH STATE EXACT CODE LINES  THAT CHANGED FROM PREVIOUS PATCH BELOW
 
-WRITE OUT THE  UPDATED PATCH FULLY EVEN  WITH THE CODE  THAT DID NOT CHANGE FROM PREVIOUS PATCH ABOVE
-      
-
-
-
-      
+WRITE OUT THE  UPDATED PATCH FULLY EVEN  WITH THE CODE  THAT DID NOT CHANGE FROM PREVIOUS PATCH BELOW
