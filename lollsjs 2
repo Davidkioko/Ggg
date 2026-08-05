@@ -1,5 +1,4 @@
    
-
 # [MODULE 01 - CONFIG_LOADER]
 import os
 from dotenv import load_dotenvload_dotenv()# --- BOOT ---
@@ -6843,27 +6842,106 @@ PATCH 24
 -    print("[MODULE 18 - KICK] Loaded v1.0.5")
 +    print("[MODULE 18 - KICK] Loaded v1.0.6")
 
+PATCH 25
+
+--- a/modules/callbacks_ui.py
++++ b/modules/callbacks_ui.py
+@@ -XX,XX +XX,XX @@ _MENU_COALESCE = {}
+ _PENDING_DELETE = {}
+ _redis_cb = None
+ _menu_coalesce_lock = asyncio.Lock()
+ _pending_delete_lock = asyncio.Lock()
++# Fixed-window rate limit for callbacks (per UID).
++# Window = 10 s, max 8 callbacks. Keys expire automatically → no cleaner.
++CB_RATE_WINDOW_SEC = 10
++CB_RATE_MAX = 8
++
+ async def _get_redis_cb():
+     global _redis_cb
+     if _redis_cb is None:
+         _redis_cb = redis.Redis(host=REDIS_HOST, decode_responses=True)
+     return _redis_cb
+ 
+ async def close_redis_cb():
+     ...
+ 
+ def uid_lock(func):
+     async def wrapper(client, query: CallbackQuery):
+         uid = query.from_user.id
+         r = await _get_redis_cb()
+         if await r.get(BOOT_LOCK_KEY):
+             await query.answer("Bot is starting, please wait", show_alert=True)
+             return
++
++        # ---- rate limit (fixed window, self-expiring keys) ----
++        rate_key = f"vip:cb_rate:{uid}"
++        try:
++            count = await r.incr(rate_key)
++            if count == 1:
++                await r.expire(rate_key, CB_RATE_WINDOW_SEC)
++            if count > CB_RATE_MAX:
++                await query.answer("Too many requests. Slow down.", show_alert=True)
++                return
++        except Exception:
++            # Fail closed: reject rather than open the flood gate
++            await query.answer("Service busy, try again shortly", show_alert=True)
++            return
++
+         lock_key = f"vip:uid_lock:{uid}"
+         token = str(uuid.uuid4())
+         if not await r.set(lock_key, token, nx=True, ex=UID_ACTION_LOCK_TTL):
+             await query.answer("Processing your last click...", show_alert=False)
+             return
+         try:
+             return await func(client, query)
+         finally:
+             current = await r.get(lock_key)
+             if current == token:
+                 await r.delete(lock_key)
+     return wrapper
+
+PATCH 26
+
+--- a/modules/config_loader.py
++++ b/modules/config_loader.py
+@@ -XX,XX +XX,XX @@ BOT_TIER = os.getenv("BOT_TIER", "free").lower()
+ IS_PAID = BOT_TIER == "paid"
+ 
+ # Derived limits - single source of truth
+-TG_SEMAPHORE = 30 if IS_PAID else 8
++TG_SEMAPHORE = 120 if IS_PAID else 8
+ TG_WORKERS = 100 if IS_PAID else 30
+ TG_SLEEP_THRESHOLD = 10 if IS_PAID else 5
+ SEND_SLEEP = 0.02 if IS_PAID else 0.05
+ DB_POOL_SIZE = 10 if IS_PAID else 3
+ DB_MAX_OVERFLOW = 20 if IS_PAID else 5
+ DB_POOL_RECYCLE = 300 if IS_PAID else 120
+ CLOUDFLARE_PING_SEC = 300 if IS_PAID else 45
+ WEBHOOK_TIMEOUT = 15 if IS_PAID else 5
+ WEBHOOK_NOTIFY_PARALLEL = 20 if IS_PAID else 5
+ 
+ # --- ALBY ---
+-ALBY_RPS = int(os.getenv("ALBY_RPS", "10" if IS_PAID else "3"))
++ALBY_RPS = int(os.getenv("ALBY_RPS", "40" if IS_PAID else "3"))p
 
 
-I WANT YOU TO CHECK IF BELOW BUG ( Resource & DoS Vectors)  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is sequentially patch 1 then patch 2,then patch 3, then patch 4, then patch 5, then patch 6, then patch 7,then PATCH 8,then PATCH 9,then patch 10,then patch 11,then patch 12,then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19,then patch 20,then patch 21,then patch 22,then patch 23,then patch 24) ON THE COMPILED MODULES
+I WANT YOU TO CHECK IF BELOW BUG ( Resource & DoS Vectors)  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is sequentially patch 1 then patch 2,then patch 3, then patch 4, then patch 5, then patch 6, then patch 7,then PATCH 8,then PATCH 9,then patch 10,then patch 11,then patch 12,then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19,then patch 20,then patch 21,then patch 22,then patch 23,then patch 24,then patch 25, then patch 26) ON THE COMPILED MODULES
 
 Resource & DoS Vectors
-* No rate limiting on callbacks beyond Redis UID lock (which can be bypassed or exhausted).
+1. MENU_COALESCE and various dict-based caches are not bounded → memory pressure on long-running bot.
 
 WARNING!!THIS IS A DRY RUN, SPECULATIVE EXECUTION, PREFLIGHT VALIDATION, WE ARE TESTING THE PATCH BELOW  IF IT WILL APPLY CLEANLY TO CODEBASE WITHOUT MODIFYING ACTIVE PROJECT FILES. MY COMPILED CODE HAS NOT BEEN PATCHED YET, THE PATCH IS A SUGESTION OF WHAT I SHOULD DO
 
 IF THE BUG (Resource & DoS Vectors) EXISTS:
 
-DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND CHECK PROVIDED MITIGATION PATCH IF IT  FOLLOWS BELOW RULES 100% UNCONDITIONALY
-1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12, then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19, then patch 20, then patch 21,then patch 22,then patch 23,then patch 24)TO THE EXISTING COMPILED MODULE.
+DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND  CHECK PROVIDED MITIGATION PATCH IF IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
+1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12, then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19, then patch 20, then patch 21,then patch 22,then patch 23,then patch 24, then patch 25,then patch 26)TO THE EXISTING COMPILED MODULE.
 2.IT SHOULD CLOSE THE ( Resource & DoS Vectors) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
 3.IT SHOULD ONLY ALTER CODE THAT  (Resource & DoS Vectors) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
 4.NO RUNTIME CRONS/CLEANERS/PERIODIC SCHEDULER ONLY ONE BOOT JANITOR THAT CAN RECOVER THE SYSYEM IN WHATEVER STATE IT WAS BEFORE FULL BOT OUTAGE
 5.LET THE SYTEM HANDLE ITSELF IF THERE IS A TIMEOUT, ERROR, CRASH 
 6.IF A PROCESS CANT HANDLE ITSELF DURING UPTIME THEN IT SHOULD BE HANDLED BY BOOT RWECOVERY DURING A FULL BOT RESTART
 7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( Resource & DoS Vectors) bug (if it exists) NO OTHER CASES
-
-
 
 WARNING!! DO NOT RESEND THE PATCH IF ALL 7 RULES ARE FOLLOWED AND THERE IS LITERALLY ZERO CODE CHANGE FROM WHAT I HAVE BELOW
                    
