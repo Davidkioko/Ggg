@@ -3687,23 +3687,962 @@ PATCH 12
 +                # so the next full restart can re-query Alby.
 
 
-I WANT YOU TO CHECK IF BELOW BUG ( Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error )  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is sequentially patch 1 then patch 2,then patch 3, then patch 4, then patch 5, then patch 6, then patch 7,then PATCH 8,then PATCH 9,then patch 10,then patch 11,then patch 12) ON THE COMPILED MODULES
+PATCH 13
 
- Alby Reconciliation is Best-Effort:
-    * Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error → stuck payments.
+--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -XX,XX +XX,XX @@ logger = logging.getLogger(__name__)
+ EXPIRING_SOON_SET = set()
+ last_kick_check = {}
+ _MENU_BUFFER = {}
+ _PENDING_DELETE = {}
++_expiring_lock = asyncio.Lock()
++_kick_check_lock = asyncio.Lock()
++_menu_buffer_lock = asyncio.Lock()
++_pending_delete_lock = asyncio.Lock()
+ 
+ async def batch_delete_messages(client, chat_id, msg_ids):
+     ...
+ 
+ async def track_activity(uid, msg_id, db: AsyncSession):
+-    _MENU_BUFFER.setdefault(uid, []).append(msg_id)
+-    if len(_MENU_BUFFER) >= 3:
+-        await _flush_activity(uid, db)
++    should_flush = False
++    async with _menu_buffer_lock:
++        _MENU_BUFFER.setdefault(uid, []).append(msg_id)
++        if len(_MENU_BUFFER.get(uid, [])) >= 3:
++            should_flush = True
++    if should_flush:
++        await _flush_activity(uid, db)
+ 
+ async def _flush_activity(uid, db: AsyncSession):
+-    if uid not in _MENU_BUFFER: return
+-    ids = _MENU_BUFFER.pop(uid)
++    async with _menu_buffer_lock:
++        if uid not in _MENU_BUFFER:
++            return
++        ids = _MENU_BUFFER.pop(uid)
+     now = datetime.now(timezone.utc)
+     ...
+ 
+ async def flush_pending_deletes(db: AsyncSession):
+-    if not _PENDING_DELETE: return
+-    for uid, ids in list(_PENDING_DELETE.items()):
+-        _PENDING_DELETE.pop(uid, None)
+-        asyncio.create_task(batch_delete_messages(app, uid, ids))
++    async with _pending_delete_lock:
++        if not _PENDING_DELETE:
++            return
++        items = list(_PENDING_DELETE.items())
++        _PENDING_DELETE.clear()
++    for uid, ids in items:
++        asyncio.create_task(batch_delete_messages(app, uid, ids))
+ 
+ async def _verify_kick(chat_id, uid, max_retries=3):
+     now = datetime.now(timezone.utc)
+-    if uid in last_kick_check:
+-        if (now - last_kick_check[uid]).total_seconds() < 10:
+-            return False
+-    last_kick_check[uid] = now
++    async with _kick_check_lock:
++        if uid in last_kick_check:
++            if (now - last_kick_check[uid]).total_seconds() < 10:
++                return False
++        last_kick_check[uid] = now
+     ...
+ 
+ async def _handle_expiry(uid, chat_id, db: AsyncSession):
+     ...
+         if ids_to_delete:
+-            _PENDING_DELETE[uid] = _PENDING_DELETE.get(uid, []) + ids_to_delete
++            async with _pending_delete_lock:
++                _PENDING_DELETE[uid] = _PENDING_DELETE.get(uid, []) + ids_to_delete
+         await set_state(u.uid, "packages", db=db)
+         await db.execute(update(User).where(User.uid==u.uid).values(active_package=None, active_channel=None, package_end=None, menu_msg_ids=json.dumps([])))
+-        last_kick_check.pop(u.uid, None)
+-        EXPIRING_SOON_SET.discard(u.uid)
++        async with _kick_check_lock:
++            last_kick_check.pop(u.uid, None)
++        async with _expiring_lock:
++            EXPIRING_SOON_SET.discard(u.uid)
+         return True
+     ...
+ 
+ async def check_expiry(db: AsyncSession):
+     now = datetime.now(timezone.utc)
+-    to_check = list(EXPIRING_SOON_SET)
++    async with _expiring_lock:
++        to_check = list(EXPIRING_SOON_SET)
+     ...
+             if not u or not u.package_end or not u.active_channel:
+-                EXPIRING_SOON_SET.discard(uid)
++                async with _expiring_lock:
++                    EXPIRING_SOON_SET.discard(uid)
+                 continue
+             ...
+-                EXPIRING_SOON_SET.discard(uid)
++                async with _expiring_lock:
++                    EXPIRING_SOON_SET.discard(uid)
+     ...
+ 
+ async def check_overstay(db: AsyncSession):
+     ...
+-                    last_kick_check.pop(u.uid, None)
+-                    EXPIRING_SOON_SET.discard(u.uid)
++                    async with _kick_check_lock:
++                        last_kick_check.pop(u.uid, None)
++                    async with _expiring_lock:
++                        EXPIRING_SOON_SET.discard(u.uid)
+ 
+ async def check_inactivity(db: AsyncSession):
+     ...
+             if ids:
+-                _PENDING_DELETE[u.uid] = _PENDING_DELETE.get(u.uid, []) + ids
++                async with _pending_delete_lock:
++                    _PENDING_DELETE[u.uid] = _PENDING_DELETE.get(u.uid, []) + ids
+             ...
+-        last_kick_check.pop(uid, None)
++        async with _kick_check_lock:
++            last_kick_check.pop(uid, None)
+ 
+ async def add_expiring_user(uid, db: AsyncSession):
+     u = await db.get(User, uid)
+     now = datetime.now(timezone.utc)
+-    if u and u.package_end and u.active_channel and u.package_end > now:
+-        EXPIRING_SOON_SET.add(uid)
+-    else:
+-        EXPIRING_SOON_SET.discard(uid)
++    async with _expiring_lock:
++        if u and u.package_end and u.active_channel and u.package_end > now:
++            EXPIRING_SOON_SET.add(uid)
++        else:
++            EXPIRING_SOON_SET.discard(uid)
+ 
+ async def repopulate_expiring_set(db: AsyncSession):
+     now = datetime.now(timezone.utc)
+     res = await db.execute(select(User.uid).where(User.package_end.isnot(None), User.active_channel.isnot(None), User.package_end > now))
+     uids = res.scalars().all()
+-    EXPIRING_SOON_SET.update(uids)
++    async with _expiring_lock:
++        EXPIRING_SOON_SET.clear()
++        EXPIRING_SOON_SET.update(uids)
+ 
+--- a/modules/packages.py
++++ b/modules/packages.py
+@@ -XX,XX +XX,XX @@ logger = logging.getLogger(__name__)
+ def remove_from_expiring(uid):
+     from modules.user_and_payment_lifecycle import EXPIRING_SOON_SET
+-    EXPIRING_SOON_SET.discard(uid)
++    # Currently dead code (no live call sites).  A single set.discard is
++    # one bytecode and therefore atomic under the cooperative asyncio
++    # event loop.  Any future live caller MUST go through the locked
++    # async path add_expiring_user / the _expiring_lock instead of this
++    # helper.
++    EXPIRING_SOON_SET.discard(uid)
+ 
+--- a/modules/gatekeeper.py
++++ b/modules/gatekeeper.py
+@@ -XX,XX +XX,XX @@ import time
+ _GATE_CACHE = {"value": None, "id": None, "ts": 0} # numeric id
+ _CHATMEM_CACHE = {}
+ CACHE_TTL_GATE = 1800
+ CACHE_TTL_CHATMEM = 30
++_gate_cache_lock = asyncio.Lock()
++_chatmem_cache_lock = asyncio.Lock()
+ 
+ async def _get_cached_gate(db):
+     now = time.time()
+-    if _GATE_CACHE["id"] and (now - _GATE_CACHE["ts"] < CACHE_TTL_GATE):
+-        return _GATE_CACHE["id"]
++    async with _gate_cache_lock:
++        if _GATE_CACHE["id"] and (now - _GATE_CACHE["ts"] < CACHE_TTL_GATE):
++            return _GATE_CACHE["id"]
+     gate = await db.get(Setting, "gate1_channel")
+     val = gate.value if gate else None
+     if val:
+         try:
+             async with tg_semaphore:
+                 chat = await app.get_chat(val)
+-                _GATE_CACHE["id"] = chat.id
++                async with _gate_cache_lock:
++                    _GATE_CACHE["id"] = chat.id
+         except:
+-            _GATE_CACHE["id"] = val
+-    _GATE_CACHE["value"] = val
+-    _GATE_CACHE["ts"] = now
+-    return _GATE_CACHE["id"]
++            async with _gate_cache_lock:
++                _GATE_CACHE["id"] = val
++    async with _gate_cache_lock:
++        _GATE_CACHE["value"] = val
++        _GATE_CACHE["ts"] = now
++        return _GATE_CACHE["id"]
+ 
+ async def check_gate(client, uid):
+     ...
+     key = (gate_id, uid)
+-    if key in _CHATMEM_CACHE:
+-        status, ts = _CHATMEM_CACHE[key]
+-        if now - ts < CACHE_TTL_CHATMEM:
+-            return status in ["member", "administrator", "creator"]
++    async with _chatmem_cache_lock:
++        if key in _CHATMEM_CACHE:
++            status, ts = _CHATMEM_CACHE[key]
++            if now - ts < CACHE_TTL_CHATMEM:
++                return status in ["member", "administrator", "creator"]
+     try:
+         async with tg_semaphore:
+             member = await client.get_chat_member(gate_id, uid)
+         status = member.status
+-        _CHATMEM_CACHE[key] = (status, now)
++        async with _chatmem_cache_lock:
++            _CHATMEM_CACHE[key] = (status, now)
+         return status in ["member", "administrator", "creator"]
+     except:
+-        _CHATMEM_CACHE[key] = ("left", now)
++        async with _chatmem_cache_lock:
++            _CHATMEM_CACHE[key] = ("left", now)
+         return False
+ 
+ @app.on_message(filters.command("setgate1") & filters.user(ADMIN_IDS))
+ async def set_gate(client, m):
+     channel = m.text.split()[1]
+     async with SessionLocal() as db:
+         async with db.begin():
+             await db.merge(Setting(key="gate1_channel", value=channel))
+-    _GATE_CACHE["value"] = None
+-    _GATE_CACHE["id"] = None
++    async with _gate_cache_lock:
++        _GATE_CACHE["value"] = None
++        _GATE_CACHE["id"] = None
+     await send_message(client, m.chat.id, "Gate1 set")
+ 
+--- a/modules/premium.py
++++ b/modules/premium.py
+@@ -XX,XX +XX,XX @@ import time
+ _PREMIUM_CACHE = []
+ _INVITE_CACHE = {}
+ _CACHE_TS = {"premium": 0, "invite": 0}
+ CACHE_TTL = 1800
++_premium_cache_lock = asyncio.Lock()
++_invite_cache_lock = asyncio.Lock()
+ 
+ async def _clear_cache_job():
+     while True:
+         await asyncio.sleep(CACHE_TTL)
+-        global _PREMIUM_CACHE, _INVITE_CACHE
+-        _PREMIUM_CACHE = []
+-        _INVITE_CACHE = {}
+-        _CACHE_TS["premium"] = 0
+-        _CACHE_TS["invite"] = 0
++        async with _premium_cache_lock:
++            global _PREMIUM_CACHE
++            _PREMIUM_CACHE = []
++            _CACHE_TS["premium"] = 0
++        async with _invite_cache_lock:
++            global _INVITE_CACHE
++            _INVITE_CACHE = {}
++            _CACHE_TS["invite"] = 0
+         get_invite_link.cache_clear()
+ 
+ async def load_premium_cache():
+     ...
+-    global _PREMIUM_CACHE
+-    _PREMIUM_CACHE = resolved
++    async with _premium_cache_lock:
++        global _PREMIUM_CACHE
++        _PREMIUM_CACHE = resolved
+     ...
+-    global _INVITE_CACHE
+-    _INVITE_CACHE = {s.key.replace("invite_", ""): s.value for s in res.scalars()}
+-    _CACHE_TS["premium"] = _CACHE_TS["invite"] = time.time()
++    async with _invite_cache_lock:
++        global _INVITE_CACHE
++        _INVITE_CACHE = {s.key.replace("invite_", ""): s.value for s in res.scalars()}
++        _CACHE_TS["invite"] = time.time()
++    async with _premium_cache_lock:
++        _CACHE_TS["premium"] = time.time()
+ 
+ async def set_premium(channels):
+     ...
+-    global _PREMIUM_CACHE
+-    _PREMIUM_CACHE = resolved
+-    _CACHE_TS["premium"] = time.time()
++    async with _premium_cache_lock:
++        global _PREMIUM_CACHE
++        _PREMIUM_CACHE = resolved
++        _CACHE_TS["premium"] = time.time()
+ 
+ async def get_premium():
+-    if not _PREMIUM_CACHE or time.time() - _CACHE_TS["premium"] > CACHE_TTL:
+-        await load_premium_cache()
+-    return _PREMIUM_CACHE
++    async with _premium_cache_lock:
++        needs_reload = not _PREMIUM_CACHE or time.time() - _CACHE_TS["premium"] > CACHE_TTL
++    if needs_reload:
++        await load_premium_cache()
++    async with _premium_cache_lock:
++        return list(_PREMIUM_CACHE)
+ 
+ async def set_invite_link(channel_id, link):
+     ...
+-    _INVITE_CACHE[str(channel_id)] = link
+-    _CACHE_TS["invite"] = time.time()
++    async with _invite_cache_lock:
++        _INVITE_CACHE[str(channel_id)] = link
++        _CACHE_TS["invite"] = time.time()
+     get_invite_link.cache_clear()
+ 
+ @lru_cache(maxsize=128)
+ async def get_invite_link(channel_id):
+-    if time.time() - _CACHE_TS["invite"] > CACHE_TTL:
+-        await load_premium_cache()
+-    return _INVITE_CACHE.get(str(channel_id))
++    async with _invite_cache_lock:
++        needs_reload = time.time() - _CACHE_TS["invite"] > CACHE_TTL
++    if needs_reload:
++        await load_premium_cache()
++    async with _invite_cache_lock:
++        return _INVITE_CACHE.get(str(channel_id))
+ 
+--- a/modules/referral_system.py
++++ b/modules/referral_system.py
+@@ -XX,XX +XX,XX @@ logger = logging.getLogger(__name__)
+ ref_links = {}
+ _REF_LINK_CACHE = {}
+ _REFERRAL_CHANNEL_CACHE = {"value": None, "ts": 0}
+ CACHE_TTL_REFERRAL = 1800
+ _REF_CONFIG_CACHE = {"daily_cap": None, "reward": None, "ts": 0}
+ CACHE_TTL_CONFIG = 300
+ _RECOVERY_DONE = False
++_ref_links_lock = asyncio.Lock()
++_ref_link_cache_lock = asyncio.Lock()
++_referral_channel_lock = asyncio.Lock()
++_ref_config_lock = asyncio.Lock()
+ 
+ async def _get_ref_config():
+     now = time.time()
+-    if _REF_CONFIG_CACHE["daily_cap"] is not None and (now - _REF_CONFIG_CACHE["ts"] < CACHE_TTL_CONFIG):
+-        return _REF_CONFIG_CACHE["daily_cap"], _REF_CONFIG_CACHE["reward"]
++    async with _ref_config_lock:
++        if _REF_CONFIG_CACHE["daily_cap"] is not None and (now - _REF_CONFIG_CACHE["ts"] < CACHE_TTL_CONFIG):
++            return _REF_CONFIG_CACHE["daily_cap"], _REF_CONFIG_CACHE["reward"]
+     daily_cap = DAILY_REF_CAP
+     reward = REFERRAL_REWARD
+-    _REF_CONFIG_CACHE.update({"daily_cap": daily_cap, "reward": reward, "ts": now})
++    async with _ref_config_lock:
++        _REF_CONFIG_CACHE.update({"daily_cap": daily_cap, "reward": reward, "ts": now})
+     return daily_cap, reward
+ 
+ async def _do_recovery():
+     ...
+-        for s in res.scalars():
+-            code = s.key.replace("ref_link_", "")
+-            owner = int(s.value)
+-            ref_links[code] = {"owner": owner, "expires": datetime.now(timezone.utc)+timedelta(hours=1), "channel": None}
++        async with _ref_links_lock:
++            for s in res.scalars():
++                code = s.key.replace("ref_link_", "")
++                owner = int(s.value)
++                ref_links[code] = {"owner": owner, "expires": datetime.now(timezone.utc)+timedelta(hours=1), "channel": None}
+     ...
+-            if expires > now:
+-                _REF_LINK_CACHE[uid] = {"link": link, "expires": expires}
++            async with _ref_link_cache_lock:
++                if expires > now:
++                    _REF_LINK_CACHE[uid] = {"link": link, "expires": expires}
+     ...
+-    _REFERRAL_CHANNEL_CACHE = {"value": numeric_id, "ts": time.time()}
++    async with _referral_channel_lock:
++        _REFERRAL_CHANNEL_CACHE = {"value": numeric_id, "ts": time.time()}
+     _RECOVERY_DONE = True
+ 
+ async def _parse_channel_id(client, raw):
+     ...
+     global _REFERRAL_CHANNEL_CACHE
+     now = time.time()
+-    if _REFERRAL_CHANNEL_CACHE["value"] and (now - _REFERRAL_CHANNEL_CACHE["ts"] < CACHE_TTL_REFERRAL):
+-        return _REFERRAL_CHANNEL_CACHE["value"]
++    async with _referral_channel_lock:
++        if _REFERRAL_CHANNEL_CACHE["value"] and (now - _REFERRAL_CHANNEL_CACHE["ts"] < CACHE_TTL_REFERRAL):
++            return _REFERRAL_CHANNEL_CACHE["value"]
+     try:
+         async with tg_semaphore:
+             chat = await client.get_chat(raw)
+         numeric_id = chat.id
+         async with SessionLocal() as db:
+             async with db.begin():
+                 await db.merge(Setting(key="referral_channel", value=str(numeric_id)))
+-        _REFERRAL_CHANNEL_CACHE = {"value": numeric_id, "ts": now}
++        async with _referral_channel_lock:
++            _REFERRAL_CHANNEL_CACHE = {"value": numeric_id, "ts": now}
+         return numeric_id
+     except:
+         return None
+ 
+ async def gen_link(client, uid):
+-    cached = _REF_LINK_CACHE.get(uid)
+-    if cached and cached["expires"] > datetime.now(timezone.utc):
+-        return cached["link"]
++    async with _ref_link_cache_lock:
++        cached = _REF_LINK_CACHE.get(uid)
++        if cached and cached["expires"] > datetime.now(timezone.utc):
++            return cached["link"]
++    async with _referral_channel_lock:
++        channel_id = _REFERRAL_CHANNEL_CACHE["value"]
+     if not channel_id:
+         channel_id = await _parse_channel_id(client, REFERRAL_CHANNEL)
+     if not channel_id:
+         return None
+     ...
+-    ref_links[code] = {"owner": uid, "expires": expires, "channel": channel_id}
+-    _REF_LINK_CACHE[uid] = {"link": link, "expires": cache_expires}
++    async with _ref_links_lock:
++        ref_links[code] = {"owner": uid, "expires": expires, "channel": channel_id}
++    async with _ref_link_cache_lock:
++        _REF_LINK_CACHE[uid] = {"link": link, "expires": cache_expires}
+     return link
+ 
+ async def ref_maintenance_loop():
+     ...
+-        expired = [k for k,v in ref_links.items() if v["expires"] < now]
+-        for k in expired:
+-            ...
+-            ref_links.pop(k, None)
+-        expired_cache = [uid for uid,v in _REF_LINK_CACHE.items() if v["expires"] < now]
+-        for uid in expired_cache:
+-            ...
+-            _REF_LINK_CACHE.pop(uid, None)
++        async with _ref_links_lock:
++            expired = [k for k,v in ref_links.items() if v["expires"] < now]
++            for k in expired:
++                ref_links.pop(k, None)
++        async with _ref_link_cache_lock:
++            expired_cache = [uid for uid,v in _REF_LINK_CACHE.items() if v["expires"] < now]
++            for uid in expired_cache:
++                _REF_LINK_CACHE.pop(uid, None)
+         ...
+ 
+--- a/modules/invites.py
++++ b/modules/invites.py
+@@ -XX,XX +XX,XX @@ import time
+ _REFERRAL_CACHE = {"value": None, "ts": 0}
+ CACHE_TTL_REFERRAL = 1800
++_referral_cache_lock = asyncio.Lock()
+ 
+ async def load_referral_cache():
+     async with SessionLocal() as db:
+         s = await db.get(Setting, "referral_channel")
+         raw = s.value if s and s.value else REFERRAL_CHANNEL
+     numeric_id = await _parse_channel_id(app, raw)
+-    global _REFERRAL_CACHE
+-    _REFERRAL_CACHE = {"value": numeric_id, "ts": time.time()}
++    async with _referral_cache_lock:
++        global _REFERRAL_CACHE
++        _REFERRAL_CACHE = {"value": numeric_id, "ts": time.time()}
+ 
+ async def get_referral_channel(client):
+     global _REFERRAL_CACHE
+     now = time.time()
+-    if _REFERRAL_CACHE["value"] is None or (now - _REFERRAL_CACHE["ts"] > CACHE_TTL_REFERRAL):
+-        await load_referral_cache()
+-    return _REFERRAL_CACHE["value"]
++    async with _referral_cache_lock:
++        needs_reload = (
++            _REFERRAL_CACHE["value"] is None
++            or (now - _REFERRAL_CACHE["ts"] > CACHE_TTL_REFERRAL)
++        )
++    if needs_reload:
++        await load_referral_cache()
++    async with _referral_cache_lock:
++        return _REFERRAL_CACHE["value"]
+ 
+--- a/modules/callbacks_ui.py
++++ b/modules/callbacks_ui.py
+@@ -XX,XX +XX,XX @@ from modules.config_loader import SEND_SLEEP, REDIS_HOST, BOOT_LOCK_KEY, UID_ACTION_LOCK_TTL
+ _MENU_COALESCE = {}
+ _PENDING_DELETE = {}
+ _redis_cb = None
++_menu_coalesce_lock = asyncio.Lock()
++_pending_delete_lock = asyncio.Lock()
+ 
+ def gate_guard(func):
+     async def wrapper(client, query: CallbackQuery):
+         ...
+                     if u and u.menu_msg_ids:
+                         loop = asyncio.get_running_loop()
+                         ids = await loop.run_in_executor(None, json.loads, u.menu_msg_ids)
+                         if ids:
+-                            _PENDING_DELETE[uid] = _PENDING_DELETE.get(uid, []) + ids
++                            async with _pending_delete_lock:
++                                _PENDING_DELETE[uid] = _PENDING_DELETE.get(uid, []) + ids
+                         u.menu_msg_ids = json.dumps([])
+         ...
+ 
+ async def vanish_and_send(client, query, photo_key, caption, markup):
+     uid = query.from_user.id
+     now = time.time()
+-    last_ts = _MENU_COALESCE.get(uid, 0)
+-    if now - last_ts < 1.0:
+-        return
+-    _MENU_COALESCE[uid] = now
++    async with _menu_coalesce_lock:
++        last_ts = _MENU_COALESCE.get(uid, 0)
++        if now - last_ts < 1.0:
++            return
++        _MENU_COALESCE[uid] = now
+     ...
+             if u and u.menu_msg_ids:
+                 ...
+                 if ids:
+-                    _PENDING_DELETE[uid] = _PENDING_DELETE.get(uid, []) + ids
++                    async with _pending_delete_lock:
++                        _PENDING_DELETE[uid] = _PENDING_DELETE.get(uid, []) + ids
+                 u.menu_msg_ids = json.dumps([])
+ 
+--- a/modules/callbacks_payment.py
++++ b/modules/callbacks_payment.py
+@@ -XX,XX +XX,XX @@ from modules.callbacks_ui import gate_guard, vanish_and_send, _safe_send, _MENU_COALESCE, uid_lock
++from modules.callbacks_ui import _menu_coalesce_lock
+ ...
+ @app.on_callback_query(filters.regex("buy"))
+ @uid_lock
+ @gate_guard
+ async def cb_buy(_, query: CallbackQuery):
+     ...
+     uid = query.from_user.id
+     now = time.time()
+-    last_ts = _MENU_COALESCE.get(uid, 0)
+-    if now - last_ts < 0.5:
+-        await query.answer("Processing...", show_alert=False)
+-        return
+-    _MENU_COALESCE[uid] = now
++    async with _menu_coalesce_lock:
++        last_ts = _MENU_COALESCE.get(uid, 0)
++        if now - last_ts < 0.5:
++            await query.answer("Processing...", show_alert=False)
++            return
++        _MENU_COALESCE[uid] = now
+     ...
+
+PATCH 14
+
+--- a/modules/entry.py
++++ b/modules/entry.py
+@@ -XX,XX +XX,XX @@ async def main():
+     r = redis.Redis(host=REDIS_HOST, decode_responses=True)
+     await r.set(BOOT_LOCK_KEY, "1", ex=RECOVERY_MAX_RUNTIME_SEC)
+     try:
+         async with SessionLocal() as db:
+             await recover_and_finalize_boot(db)
+             await db.commit()
+         # Delete only after the boot janitor has completed without error.
+         # On any exception the key is left until TTL; process will exit and
+         # the next full restart re-runs recovery under a fresh lock.
+         await r.delete(BOOT_LOCK_KEY)
+     finally:
+         await r.close()
+     config.SYSTEM_LOCKED = False
+-    scheduler.start()
++    # Scheduler is intentionally never started.
++    # All background work that previously expected periodic jobs
++    # (expiry / overstay / inactivity / referral maintenance) is
++    # either event-driven or recovered exclusively by the single
++    # boot janitor on a full process restart.  Starting an empty
++    # AsyncIOScheduler is the fragility this patch removes.
+     asyncio.create_task(start_webhook_server())
+     await app.start()
+     print("VIP Bot running")
+--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -XX,XX +XX,XX @@ async def recover_and_finalize_boot(db: AsyncSession):
+     # ------------------------------------------------------------------
+     # BOOT JANITOR – sole authority that may force intermediate states
+     # into a terminal state after a full outage. No runtime cron.
+     #
+     # payment_version=3 is the universal terminal marker:
+     # - state='paid' + tokens_credited=True → success path
+     # - state='dead' → timed-out unpaid
+     # No other code path may write version=3.
+     # ------------------------------------------------------------------
+     async with SessionLocal() as phase_db:
+         async with phase_db.begin():
+             await phase_db.execute(text(
+                 "UPDATE users SET invoice_lock_until=NULL "
+                 "WHERE invoice_lock_until < now()"
+             ))
+ 
++    # One-time package-expiry recovery (the work that the never-scheduled
++    # check_expiry / check_overstay jobs would have performed).
++    # Runs under the same boot lock already held by the caller; any
++    # failure simply leaves the process to exit and the next full
++    # restart will retry.  No runtime periodic job is introduced.
++    # kick_expired_on_boot owns its own transaction (async with db.begin()).
++    async with SessionLocal() as phase_db:
++        await kick_expired_on_boot(phase_db)
++
+     # Single atomic pass: lock every non-terminal row ...
+     async with SessionLocal() as phase_db:
+         async with phase_db.begin():
+             await phase_db.execute(
+                 select(1).execution_options(isolation_level="SERIALIZABLE")
+             )
+             ...
+
+PATCH 15
+
+--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -XXX,XX +XXX,XX @@ async def recover_and_finalize_boot(db: AsyncSession):
+     # ------------------------------------------------------------------
+     # BOOT JANITOR – sole authority that may force intermediate states
+     # into a terminal state after a full outage. No runtime cron.
+     #
+     # payment_version=3 is the universal terminal marker:
+     # - state='paid' + tokens_credited=True → success path
+     # - state='dead' → timed-out unpaid
+     # No other code path may write version=3.
+     # ------------------------------------------------------------------
+     async with SessionLocal() as phase_db:
+         async with phase_db.begin():
+             await phase_db.execute(text(
+                 "UPDATE users SET invoice_lock_until=NULL "
+                 "WHERE invoice_lock_until < now()"
+             ))
+ 
+     # One-time package-expiry recovery (the work that the never-scheduled
+     # check_expiry / check_overstay jobs would have performed).
+     # Runs under the same boot lock already held by the caller; any
+     # failure simply leaves the process to exit and the next full
+     # restart will retry.  No runtime periodic job is introduced.
+     # kick_expired_on_boot owns its own transaction (async with db.begin()).
+     async with SessionLocal() as phase_db:
+         await kick_expired_on_boot(phase_db)
+ 
++    # One-time referral-link / cache / invite cleanup (the work that the
++    # never-started ref_maintenance_loop would have performed).
++    # Pure best-effort under the boot lock; any exception aborts the
++    # process so the next full restart re-runs the whole janitor.
++    # No runtime loop is ever started.
++    from modules.referral_system import (
++        ref_links, _REF_LINK_CACHE,
++        _ref_links_lock, _ref_link_cache_lock,
++    )
++    from db.models import Setting
++    from sqlalchemy import delete
++    now = datetime.now(timezone.utc)
++    async with SessionLocal() as phase_db:
++        async with phase_db.begin():
++            # DB rows
++            res = await phase_db.execute(
++                select(Setting).where(Setting.key.like("ref_invite_%"))
++            )
++            to_delete = []
++            for s in res.scalars():
++                try:
++                    _, exp = s.value.split("|")
++                    if datetime.fromisoformat(exp) < now:
++                        to_delete.append(s.key)
++                except Exception:
++                    to_delete.append(s.key)
++            for key in to_delete:
++                await phase_db.execute(
++                    delete(Setting).where(Setting.key == key)
++                )
++
++            res = await phase_db.execute(
++                select(Setting).where(Setting.key.like("ref_link_%"))
++            )
++            for s in res.scalars():
++                # ref_link_* have no embedded expiry; they are reaped
++                # only when the corresponding in-memory entry has expired
++                # (handled below).  Leave them for the memory pass.
++                pass
++
++            res = await phase_db.execute(
++                select(Setting).where(Setting.key.like("ref_cache_%"))
++            )
++            for s in res.scalars():
++                try:
++                    _, ts = s.value.split("|")
++                    if datetime.fromisoformat(ts) < now:
++                        await phase_db.execute(
++                            delete(Setting).where(Setting.key == s.key)
++                        )
++                except Exception:
++                    await phase_db.execute(
++                        delete(Setting).where(Setting.key == s.key)
++                    )
++
++    # In-memory maps (already locked by Patch 13)
++    async with _ref_links_lock:
++        expired = [k for k, v in ref_links.items() if v["expires"] < now]
++        for k in expired:
++            ref_links.pop(k, None)
++            # also drop the matching Settings row if still present
++            async with SessionLocal() as phase_db:
++                async with phase_db.begin():
++                    await phase_db.execute(
++                        delete(Setting).where(Setting.key == f"ref_link_{k}")
++                    )
++    async with _ref_link_cache_lock:
++        expired_cache = [
++            uid for uid, v in _REF_LINK_CACHE.items() if v["expires"] < now
++        ]
++        for uid in expired_cache:
++            _REF_LINK_CACHE.pop(uid, None)
++            async with SessionLocal() as phase_db:
++                async with phase_db.begin():
++                    await phase_db.execute(
++                        delete(Setting).where(
++                            Setting.key == f"ref_cache_{uid}"
++                        )
++                    )
++
+     # Single atomic pass: lock every non-terminal row ...
+     async with SessionLocal() as phase_db:
+         async with phase_db.begin():
+             await phase_db.execute(
+                 select(1).execution_options(isolation_level="SERIALIZABLE")
+             )
+             ...
+
+PATCH 16
+
+--- a/modules/state_manager.py
++++ b/modules/state_manager.py
+@@ -1,20 +1,48 @@
+ from db.db import SessionLocal
+ from db.models import User
+ from sqlalchemy import select, func
++from sqlalchemy.ext.asyncio import AsyncSession
+ 
+-async def set_state(uid, state):
+-    async with SessionLocal() as db:
+-        async with db.begin():  
+-            u = await db.get(User, uid)
+-            if not u:
+-                u = User(uid=uid)
+-                db.add(u)
+-            u.state = state
+-            u.last_activity = func.now() 
+-        # 2026-04-29 FIX #1: removed stray db.begin() block line causing syntax error
++async def set_state(uid, state, db: AsyncSession = None):
++    """
++    Set user state + last_activity.
++    - When called with an external db that is already inside a transaction
++      (the common post-Patch-1..15 pattern), mutate under that session and
++      do NOT open a nested begin().
++    - When called with db=None, open a short-lived session + transaction
++      exactly as before.
++    This is the sole change required to restore transaction hygiene;
++    no other behaviour is altered.
++    """
++    own_session = db is None
++    if own_session:
++        db = SessionLocal()
++    try:
++        if own_session:
++            async with db.begin():
++                await _set_state_inner(uid, state, db)
++        else:
++            # Caller already holds the transaction / FOR UPDATE / SERIALIZABLE.
++            await _set_state_inner(uid, state, db)
++    finally:
++        if own_session:
++            await db.close()
++
++
++async def _set_state_inner(uid, state, db: AsyncSession):
++    u = await db.get(User, uid)
++    if not u:
++        u = User(uid=uid)
++        db.add(u)
++    u.state = state
++    u.last_activity = func.now()
+ 
+-async def get_state(uid):
+-    async with SessionLocal() as db:
+-        u = await db.get(User, uid)
+-        return u.state if u else "gate1"
++
++async def get_state(uid, db: AsyncSession = None):
++    own_session = db is None
++    if own_session:
++        db = SessionLocal()
++    try:
++        u = await db.get(User, uid)
++        return u.state if u else "gate1"
++    finally:
++        if own_session:
++            await db.close()
+ 
+ # [MODULE 05 - STATE_MANAGER] v1.0.3
+ # 2026-04-29 FIX #1: bump version after syntax fix
++# 2026-08-05 FIX #2: optional external session for transaction hygiene
+ if __name__ != "__main__":
+-    print("[MODULE 05 - STATE_MANAGER] Loaded v1.0.3")
++    print("[MODULE 05 - STATE_MANAGER] Loaded v1.0.4")
+
+PATCH 17
+
+--- a/modules/webhook_server.py
++++ b/modules/webhook_server.py
+@@ -XX,XX +XX,XX @@ async def alby_webhook(request):
+     tokens_to_credit = int(round(amount_usd * TOKENS_PER_USD)) if amount_usd else 0
+
+-    async with SessionLocal() as db:
+-        try:
+-            async with db.begin():
+-                await db.execute(text("""
+-                    INSERT INTO payment_webhook_events (invoice_id, client_ref, payload, received_at)
+-                    VALUES (:inv, :ref, :payload, :ts)
+-                    ON CONFLICT (invoice_id) DO NOTHING
+-                """), {"inv": invoice_id, "ref": client_ref, "payload": json.dumps(data), "ts": datetime.now(timezone.utc)})
+-        except Exception as e:
+-            log.error("audit insert failed: %s", e)
+-            try:
+-                await db.rollback()
+-            except Exception:
+-                pass
+-            raise
+-
+-        payment_id_for_redis = None
+-        uid_for_notify = None
+-        try:
+-            async with db.begin():
+-                await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
+-                stmt = select(Payment).where(or_(Payment.invoice_id == invoice_id, Payment.client_ref == client_ref)).with_for_update()
+-                res = await db.execute(stmt)
+-                payment = res.scalar_one_or_none()
+-                if not payment:
+-                    return web.Response(status=200, text="ok")
+-                if payment.tokens_credited:
+-                    return web.Response(status=200, text="ok")
+-                # Single atomic claim+credit. Version can only ever move
+-                # 1→3 or 2→3 under the same FOR UPDATE + version guard.
+-                # Intermediate 'open'/version=2 is no longer written by the
+-                # live path; only the boot janitor may still see it.
+-                if (payment.paid is False and payment.tokens_credited is False
+-                        and payment.payment_version in (1, 2)):
+-                    ok = await add_tokens(
+-                        payment.uid, payment.tokens,
+-                        payment_id=payment.id, reason='recovery', db=db,
+-                        invoice_id=invoice_id,
+-                        payment_request=payment_request,
+-                        expires_at=expires_at,
+-                    )
+-                    if not ok:
+-                        # Another concurrent finalizer already claimed it –
+-                        # treat as success (idempotent).
+-                        pass
+-                payment_id_for_redis = payment.id
+-                uid_for_notify = payment.uid
+-                tokens_to_credit = payment.tokens
+-        except Exception as e:
+-            log.error("webhook credit transaction failed for inv %s ref %s: %s", invoice_id, client_ref, e)
+-            return web.Response(status=200, text="ok")
++    payment_id_for_redis = None
++    uid_for_notify = None
++    # Single transaction: audit insert + claim/credit under one begin().
++    # Either both succeed or both roll back. No partial commit is possible.
++    # Crash / timeout / exception → transaction aborts; boot janitor is the
++    # sole recovery authority for any non-terminal payment row.
++    async with SessionLocal() as db:
++        try:
++            async with db.begin():
++                await db.execute(text("""
++                    INSERT INTO payment_webhook_events (invoice_id, client_ref, payload, received_at)
++                    VALUES (:inv, :ref, :payload, :ts)
++                    ON CONFLICT (invoice_id) DO NOTHING
++                """), {
++                    "inv": invoice_id,
++                    "ref": client_ref,
++                    "payload": json.dumps(data),
++                    "ts": datetime.now(timezone.utc),
++                })
++
++                await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
++                stmt = select(Payment).where(
++                    or_(Payment.invoice_id == invoice_id, Payment.client_ref == client_ref)
++                ).with_for_update()
++                res = await db.execute(stmt)
++                payment = res.scalar_one_or_none()
++                if not payment:
++                    # Audit row (if newly inserted) stays; nothing to credit.
++                    return web.Response(status=200, text="ok")
++                if payment.tokens_credited:
++                    return web.Response(status=200, text="ok")
++
++                # Single atomic claim+credit (post-Patch-2/3/9 semantics).
++                # Version may only move 1|2|4 → 3 under the same FOR UPDATE.
++                if (payment.paid is False
++                        and payment.tokens_credited is False
++                        and payment.payment_version in (1, 2, 4)):
++                    ok = await add_tokens(
++                        payment.uid,
++                        payment.tokens,
++                        payment_id=payment.id,
++                        reason='recovery',
++                        db=db,
++                        invoice_id=invoice_id,
++                        payment_request=getattr(payment, "payment_request", None),
++                        expires_at=getattr(payment, "expires_at", None),
++                    )
++                    if not ok:
++                        # Concurrent finalizer already claimed it – idempotent.
++                        pass
++
++                payment_id_for_redis = payment.id
++                uid_for_notify = payment.uid
++                tokens_to_credit = payment.tokens
++        except Exception as e:
++            log.error(
++                "webhook credit transaction failed for inv %s ref %s: %s",
++                invoice_id, client_ref, e,
++            )
++            # Transaction already rolled back by the context manager.
++            # Return 200 so Alby does not retry storm; boot janitor recovers
++            # any non-terminal payment on next full restart.
++            return web.Response(status=200, text="ok")
+
+     if uid_for_notify and payment_id_for_redis:
+         asyncio.create_task(_send_notify_messages(uid_for_notify, tokens_to_credit))
+         try:
+             r = await _get_redis()
+             await r.set(
+                 f"vip:side:payment:{payment_id_for_redis}",
+                 "1",
+                 nx=True,
+                 ex=IDEMPOTENCY_TTL,
+             )
+         except Exception as e:
+             log.warning(
+                 "Redis side-effect key failed after commit for payment %s: %s",
+                 payment_id_for_redis, e,
+             )
+
+     return web.Response(status=200, text="ok")
+
+
+I WANT YOU TO CHECK IF BELOW BUG ( Transaction & Session Hygiene Violations )  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is sequentially patch 1 then patch 2,then patch 3, then patch 4, then patch 5, then patch 6, then patch 7,then PATCH 8,then PATCH 9,then patch 10,then patch 11,then patch 12,then patch 13,then patch 14,then patch 15,then patch 16,then patch 17) ON THE COMPILED MODULES
+
+Transaction & Session Hygiene Violations
+1.recover_and_finalize_boot (26): Six separate SessionLocal() contexts with external Alby calls in between. No overarching transaction or consistent locking.
 
 WARNING!!THIS IS A DRY RUN, SPECULATIVE EXECUTION, PREFLIGHT VALIDATION, WE ARE TESTING THE PATCH BELOW  IF IT WILL APPLY CLEANLY TO CODEBASE WITHOUT MODIFYING ACTIVE PROJECT FILES. MY COMPILED CODE HAS NOT BEEN PATCHED YET, THE PATCH IS A SUGESTION OF WHAT I SHOULD DO
 
-IF THE BUG (Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error) EXISTS:
+IF THE BUG (Transaction & Session Hygiene Violations) EXISTS:
 
-DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND PROVIDE A MITIGATION PATCH THAT IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
-1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12 )TO THE EXISTING COMPILED MODULE.
-2.IT SHOULD CLOSE THE ( Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
-3.IT SHOULD ONLY ALTER CODE THAT  ( Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
+DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND CHECK PROVIDED MITIGATION PATCH IF IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
+1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12, then patch 13,then patch 14,then patch 15,then patch 16,then patch 17 )TO THE EXISTING COMPILED MODULE.
+2.IT SHOULD CLOSE THE ( Transaction & Session Hygiene Violations) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
+3.IT SHOULD ONLY ALTER CODE THAT  (Transaction & Session Hygiene Violations) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
 4.NO RUNTIME CRONS/CLEANERS/PERIODIC SCHEDULER ONLY ONE BOOT JANITOR THAT CAN RECOVER THE SYSYEM IN WHATEVER STATE IT WAS BEFORE FULL BOT OUTAGE
 5.LET THE SYTEM HANDLE ITSELF IF THERE IS A TIMEOUT, ERROR, CRASH 
 6.IF A PROCESS CANT HANDLE ITSELF DURING UPTIME THEN IT SHOULD BE HANDLED BY BOOT RWECOVERY DURING A FULL BOT RESTART
-7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE (Many alby_is_paid_by_ref / alby_is_paid calls can return None on network error  ) bug (if it exists) NO OTHER CASES
+7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE (Transaction & Session Hygiene Violations ) bug (if it exists) NO OTHER CASES
 
 WARNING!! DO NOT RESEND THE PATCH IF ALL 7 RULES ARE FOLLOWED AND THERE IS LITERALLY ZERO CODE CHANGE FROM WHAT I HAVE BELOW
                    
