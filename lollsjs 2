@@ -7129,26 +7129,429 @@ PATCH 28
              except: pass
          await asyncio.sleep(0.1)
 
-I WANT YOU TO CHECK IF BELOW BUG ( Cache Incoherence & Stale Reads)  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is sequentially patch 1 then patch 2,then patch 3, then patch 4, then patch 5, then patch 6, then patch 7,then PATCH 8,then PATCH 9,then patch 10,then patch 11,then patch 12,then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19,then patch 20,then patch 21,then patch 22,then patch 23,then patch 24,then patch 25, then patch 26,then patch 27, then patch 28) ON THE COMPILED MODULES
 
-Cache Incoherence & Stale Reads
-1. _GATE_CACHE, _PREMIUM_CACHE, _REFERRAL_CACHE, _INVITE_CACHE have no invalidation on admin changes except manual calls in specific admin commands.
+PATCH 29
+
+--- a/modules/premium.py
++++ b/modules/premium.py
+@@ -1,40 +1,55 @@
+ from sqlalchemy import select
+ from db.db import SessionLocal
+ from db.models import Setting
+ import time
+ import asyncio
+ from functools import lru_cache
+ 
+ _PREMIUM_CACHE = []
+ _INVITE_CACHE = {}
+ _CACHE_TS = {"premium": 0, "invite": 0}
+ CACHE_TTL = 1800
++_premium_lock = asyncio.Lock()
++_invite_lock = asyncio.Lock()
+ 
+-async def _clear_cache_job():
+-    """Background job to clear caches every 30min"""
+-    while True:
+-        await asyncio.sleep(CACHE_TTL)
+-        global _PREMIUM_CACHE, _INVITE_CACHE
+-        _PREMIUM_CACHE = []
+-        _INVITE_CACHE = {}
+-        _CACHE_TS["premium"] = 0
+-        _CACHE_TS["invite"] = 0
+-        get_invite_link.cache_clear()
+-
+-def start_cache_clear():
+-    """Call this on bot startup"""
+-    asyncio.create_task(_clear_cache_job())
+-
+ async def load_premium_cache():
+     from core.bot import app, tg_semaphore
+     async with SessionLocal() as db:
+         s = await db.get(Setting, "premium_channels")
+         raw_channels = s.value.split(",") if s and s.value else []
+         resolved = []
+         for ch in raw_channels:
+             ch = ch.strip()
+             if not ch:
+                 continue
+             try:
+                 cid = int(ch)
+                 resolved.append(cid)
+             except Exception:
+                 pass
+         res = await db.execute(select(Setting).where(Setting.key.like("invite_%")))
+         invite_map = {s.key.replace("invite_", ""): s.value for s in res.scalars()}
+     async with _premium_lock:
+         global _PREMIUM_CACHE
+         _PREMIUM_CACHE = resolved
+         _CACHE_TS["premium"] = time.time()
+     async with _invite_lock:
+         global _INVITE_CACHE
+         _INVITE_CACHE = invite_map
+         _CACHE_TS["invite"] = time.time()
+         get_invite_link.cache_clear()
+ 
+ async def set_premium(channels):
+     from core.bot import app, tg_semaphore
+     resolved = []
+     for ch in channels:
+         ch = ch.strip()
+         if not ch:
+             continue
+         try:
+             async with tg_semaphore:
+                 chat = await app.get_chat(ch)
+             resolved.append(chat.id)
+         except Exception:
+             pass
+     async with SessionLocal() as db:
+         async with db.begin():
+             await db.merge(Setting(key="premium_channels", value=",".join(str(x) for x in resolved)))
+     async with _premium_lock:
+         global _PREMIUM_CACHE
+         _PREMIUM_CACHE = resolved
+         _CACHE_TS["premium"] = time.time()
+ 
+ async def get_premium():
+     async with _premium_lock:
+         if _PREMIUM_CACHE and (time.time() - _CACHE_TS["premium"] <= CACHE_TTL):
+             return list(_PREMIUM_CACHE)
+     await load_premium_cache()
+     async with _premium_lock:
+         return list(_PREMIUM_CACHE)
+ 
+ async def set_invite_link(channel_id, link):
+     async with SessionLocal() as db:
+         async with db.begin():
+             await db.merge(Setting(key=f"invite_{channel_id}", value=link))
+     async with _invite_lock:
+         _INVITE_CACHE[str(channel_id)] = link
+         _CACHE_TS["invite"] = time.time()
+         get_invite_link.cache_clear()
+ 
+ @lru_cache(maxsize=128)
+ async def get_invite_link(channel_id):
+     async with _invite_lock:
+         if time.time() - _CACHE_TS["invite"] <= CACHE_TTL:
+             return _INVITE_CACHE.get(str(channel_id))
+     await load_premium_cache()
+     async with _invite_lock:
+         return _INVITE_CACHE.get(str(channel_id))
+ 
+ if __name__ != "__main__":
+     print("[MODULE 14 - PREMIUM_UTILS] Loaded v1.0.9")
+diff--- a/modules/gatekeeper.py
++++ b/modules/gatekeeper.py
+@@ -XX,XX +XX,XX @@ async def set_gate(client, m):
+     channel = m.text.split()[1]
+     async with SessionLocal() as db:
+         async with db.begin():
+             await db.merge(Setting(key="gate1_channel", value=channel))
+     async with _gate_cache_lock:
+         _GATE_CACHE["value"] = None
+         _GATE_CACHE["id"] = None
+         _GATE_CACHE["ts"] = 0
+     await send_message(client, m.chat.id, "Gate1 set")
+diff--- a/modules/invites.py
++++ b/modules/invites.py
+@@ -XX,XX +XX,XX @@ async def load_referral_cache():
+     async with SessionLocal() as db:
+         s = await db.get(Setting, "referral_channel")
+         raw = s.value if s and s.value else REFERRAL_CHANNEL
+     numeric_id = await _parse_channel_id(app, raw)
+     async with _referral_cache_lock:
+         global _REFERRAL_CACHE
+         _REFERRAL_CACHE = {"value": numeric_id, "ts": time.time()}
+diff--- a/modules/admin_commands.py
++++ b/modules/admin_commands.py
+@@ -XX,XX +XX,XX @@ async def defaults_cmd(_, m: Message):
+     ...
+     if needs_reload == "premium_channels":
+         await load_premium_cache()
+     if needs_reload == "referral_channel":
+         await load_referral_cache()
+diff--- a/modules/entry.py
++++ b/modules/entry.py
+@@ -XX,XX +XX,XX @@ async def main():
+     ...
+     await load_gif_cache()
+     await load_premium_cache()
+     await load_referral_cache()
+     await load_ref_cache()
+     # No start_cache_clear() / no background cache job.
+     # Sole recovery authority remains the boot janitor.
+
+
+PATCH 30
+
+--- a/modules/gatekeeper.py
++++ b/modules/gatekeeper.py
+@@ -XX,XX +XX,XX @@ _GATE_CACHE = {"value": None, "id": None, "ts": 0}
+ _CHATMEM_CACHE = {}
+ CACHE_TTL_GATE = 1800
+-CACHE_TTL_CHATMEM = 30
+ _gate_cache_lock = asyncio.Lock()
+ _chatmem_cache_lock = asyncio.Lock()
+ CHATMEM_CACHE_MAX = 30_000
+ 
+ def _chatmem_set(key, status, now):
+-    _CHATMEM_CACHE[key] = (status, now)
+-    if len(_CHATMEM_CACHE) > CHATMEM_CACHE_MAX:
+-        try:
+-            _CHATMEM_CACHE.pop(next(iter(_CHATMEM_CACHE)))
+-        except (StopIteration, RuntimeError):
+-            pass
++    """Bounded store used solely for negative (left) results.
++    Positive membership is never cached – always re-validated against Telegram.
++    """
++    if status in ("member", "administrator", "creator"):
++        # Do not cache positive grants. Drop any prior entry for this key.
++        _CHATMEM_CACHE.pop(key, None)
++        return
++    _CHATMEM_CACHE[key] = (status, now)
++    if len(_CHATMEM_CACHE) > CHATMEM_CACHE_MAX:
++        try:
++            _CHATMEM_CACHE.pop(next(iter(_CHATMEM_CACHE)))
++        except (StopIteration, RuntimeError):
++            pass
+ 
+ async def check_gate(client, uid):
+     async with SessionLocal() as db:
+         gate_id = await _get_cached_gate(db)
+         if not gate_id:
+             return False
+     now = time.time()
+     key = (gate_id, uid)
+-    async with _chatmem_cache_lock:
+-        if key in _CHATMEM_CACHE:
+-            status, ts = _CHATMEM_CACHE[key]
+-            if now - ts < CACHE_TTL_CHATMEM:
+-                return status in ["member", "administrator", "creator"]
+-            else:
+-                # Lazy TTL prune
+-                del _CHATMEM_CACHE[key]
++    # Positive results are NEVER served from cache.
++    # Only a recent explicit "left" may short-circuit to False
++    # (harmless denial, never a security grant).
++    async with _chatmem_cache_lock:
++        if key in _CHATMEM_CACHE:
++            status, ts = _CHATMEM_CACHE[key]
++            if status == "left" and (now - ts) < 5:   # very short negative TTL
++                return False
++            # any other entry (or expired) → fall through to live check
++            _CHATMEM_CACHE.pop(key, None)
+     try:
+         async with tg_semaphore:
+             member = await client.get_chat_member(gate_id, uid)
+         status = member.status
+         async with _chatmem_cache_lock:
+             _chatmem_set(key, status, now)
+         return status in ["member", "administrator", "creator"]
+     except Exception:
+         async with _chatmem_cache_lock:
+             _chatmem_set(key, "left", now)
+         return False
+
+PATCH 31
+
+--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -XXX,XX +XXX,XX @@ async def check_expiry(db: AsyncSession):
+- now = datetime.now(timezone.utc)
+- to_check = list(EXPIRING_SOON_SET)
+- expired_data = []
+- async with db.begin():
+- for uid in to_check:
+- u = await db.get(User, uid)
+- if not u or not u.package_end or not u.active_channel:
+- EXPIRING_SOON_SET.discard(uid)
+- continue
+- if u.package_end <= now + timedelta(minutes=5):
+- await kick_with_fallback(app, int(u.active_channel), uid)
+- did_expire = await _handle_expiry(uid, int(u.active_channel), db=db)
+- if did_expire:
+- await track_activity(uid, 0, db=db)
+- expired_data.append((uid, int(u.active_channel)))
+- else:
+- EXPIRING_SOON_SET.discard(uid)
+- for uid, chat_id in expired_data:
+- async with SessionLocal() as check_db:
+- res = await check_db.execute(select(User.package_end).where(User.uid==uid))
+- if res.scalar_one_or_none() is not None:
+- continue
+- await app.send_animation(uid, animation=await get_gif("main"), caption=" EXPIRED\nYour access time is up.", reply_markup=packages_menu())
+-
+-async def check_overstay(db: AsyncSession):
+- now = datetime.now(timezone.utc)
+- grace = timedelta(seconds=OVERSTAY_MAX_SEC)
+- window_end = now + grace
+- BATCH = 200
+- async with db.begin():
+- res = await db.execute(select(User).where(User.package_end!= None, User.active_channel!= None, User.package_end <= window_end).order_by(User.package_end.asc()).limit(BATCH))
+- users = res.scalars().all()
+- for u in users:
+- if u.package_end + grace <= now:
+- chat_id = int(u.active_channel)
+- await kick_with_fallback(app, chat_id, u.uid)
+- kicked = await _verify_kick(chat_id, u.uid)
+- if kicked:
+- await db.execute(update(User).where(User.uid==u.uid).values(active_package=None, active_channel=None, package_end=None))
+- last_kick_check.pop(u.uid, None)
+- EXPIRING_SOON_SET.discard(u.uid)
++# Single authoritative live expiry path.
++# Uses the same grace window that the boot janitor already understands
++# (OVERSTAY_MAX_SEC). Snapshot is taken under _expiring_lock; network
++# I/O is performed outside the lock; the terminal clear re-acquires the
++# lock only for the short FOR-UPDATE + UPDATE. Concurrent scheduler
++# ticks therefore cannot interleave a double-clear, and long Telegram
++# latency cannot starve add_expiring_user.
++async def check_expiry(db: AsyncSession):
++    now = datetime.now(timezone.utc)
++    grace = timedelta(seconds=OVERSTAY_MAX_SEC)
++    window_end = now + grace
++    BATCH = 200
++
++    # 1. Snapshot candidates under the lock (in-memory set + bounded
++    # DB safety-net). No network I/O while the lock is held.
++    candidates = []
++    async with _expiring_lock:
++        async with db.begin():
++            to_check = list(EXPIRING_SOON_SET)
++            for uid in to_check:
++                u = await db.get(User, uid)
++                if not u or not u.package_end or not u.active_channel:
++                    EXPIRING_SOON_SET.discard(uid)
++                    continue
++                if u.package_end <= window_end:
++                    candidates.append((uid, int(u.active_channel), u.package_end))
++
++            if len(candidates) < BATCH:
++                res = await db.execute(
++                    select(User.uid, User.active_channel, User.package_end)
++                    .where(
++                        User.package_end.isnot(None),
++                        User.active_channel.isnot(None),
++                        User.package_end <= window_end,
++                    )
++                    .order_by(User.package_end.asc())
++                    .limit(BATCH - len(candidates))
++                )
++                for uid, chat_id, package_end in res.all():
++                    if (uid, int(chat_id), package_end) not in candidates:
++                        candidates.append((uid, int(chat_id), package_end))
++
++    # 2. Network side-effects outside the lock.
++    expired_data = []
++    for uid, chat_id, package_end in candidates:
++        if package_end + grace > now:
++            # Still inside the grace window – leave for next tick
++            # or for the boot janitor.
++            continue
++        await kick_with_fallback(app, chat_id, uid)
++        kicked = await _verify_kick(chat_id, uid)
++        if not kicked:
++            for admin in ADMIN_IDS:
++                try:
++                    await app.send_message(
++                        admin,
++                        f"[LEAK ALERT] Failed to kick UID {uid} from {chat_id} after expiry",
++                    )
++                except Exception:
++                    pass
++            continue
++
++        # 3. Terminal DB clear under a short critical section.
++        # Re-check the row so a concurrent activate_package cannot
++        # be overwritten. Lock is held only for the FOR UPDATE +
++        # UPDATE, never across network.
++        async with _expiring_lock:
++            async with SessionLocal() as phase_db:
++                async with phase_db.begin():
++                    res = await phase_db.execute(
++                        select(User)
++                        .where(User.uid == uid)
++                        .with_for_update()
++                    )
++                    u = res.scalar_one_or_none()
++                    if not u or u.package_end is None or u.active_channel is None:
++                        EXPIRING_SOON_SET.discard(uid)
++                        continue
++                    if u.package_end + grace > now:
++                        # Race: package was re-activated while we were
++                        # kicking. Leave it alone.
++                        continue
++
++                    # Preserve the original menu-vanishing contract so the
++                    # later flush removes UI messages.  Bound is enforced
++                    # by the existing _bounded_set helper.
++                    from modules.callbacks_ui import (
++                        _bounded_set, PENDING_DELETE_MAX, _pending_delete_lock
++                    )
++                    loop = asyncio.get_running_loop()
++                    try:
++                        ids_to_delete = await loop.run_in_executor(
++                            None, json.loads, u.menu_msg_ids or "[]"
++                        )
++                    except Exception:
++                        ids_to_delete = []
++                    if ids_to_delete:
++                        async with _pending_delete_lock:
++                            cur = _PENDING_DELETE.get(uid, [])
++                            cur.extend(ids_to_delete)
++                            _bounded_set(_PENDING_DELETE, uid, cur, PENDING_DELETE_MAX)
++
++                    await phase_db.execute(
++                        update(User)
++                        .where(User.uid == uid)
++                        .values(
++                            active_package=None,
++                            active_channel=None,
++                            package_end=None,
++                            menu_msg_ids="[]",
++                        )
++                    )
++                    await set_state(uid, "packages", db=phase_db)
++                    last_kick_check.pop(uid, None)
++                    EXPIRING_SOON_SET.discard(uid)
++                    expired_data.append(uid)
++
++    # 4. Notify only after the DB clear has committed.
++    for uid in expired_data:
++        try:
++            await app.send_animation(
++                uid,
++                animation=await get_gif("main"),
++                caption=" EXPIRED\nYour access time is up.",
++                reply_markup=packages_menu(),
++            )
++        except Exception:
++            pass
++
++# Thin no-op stub. Any pre-existing scheduler job that still calls
++# check_overstay becomes a harmless no-op. The dual-window race is
++# eliminated because the only live path is the single-window
++# check_expiry above. Residual expired rows after a crash are
++# recovered exclusively by the boot janitor.
++async def check_overstay(db: AsyncSession):
++    return
+
+
+
+I WANT YOU TO CHECK IF BELOW BUG ( Overstay / Expiry Race:)  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is sequentially patch 1 then patch 2,then patch 3, then patch 4, then patch 5, then patch 6, then patch 7,then PATCH 8,then PATCH 9,then patch 10,then patch 11,then patch 12,then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19,then patch 20,then patch 21,then patch 22,then patch 23,then patch 24,then patch 25, then patch 26,then patch 27, then patch 28,then patch 29,then patch 30,then patch 31) ON THE COMPILED MODULES
+
+Overstay / Expiry Race:
+1.EXPIRING_SOON_SET is in-memory only → on restart, repopulate_expiring_set runs, but there's a gap where users with expired packages aren't kicked immediately.
 
 WARNING!!THIS IS A DRY RUN, SPECULATIVE EXECUTION, PREFLIGHT VALIDATION, WE ARE TESTING THE PATCH BELOW  IF IT WILL APPLY CLEANLY TO CODEBASE WITHOUT MODIFYING ACTIVE PROJECT FILES. MY COMPILED CODE HAS NOT BEEN PATCHED YET, THE PATCH IS A SUGESTION OF WHAT I SHOULD DO
 
-IF THE BUG (Cache Incoherence & Stale Reads) EXISTS:
+IF THE BUG (Overstay / Expiry Race) EXISTS:
 
-DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND CHECK PROVIDED MITIGATION PATCH IF IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
-1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12, then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19, then patch 20, then patch 21,then patch 22,then patch 23,then patch 24, then patch 25,then patch 26,then patch 27,then patch 28)TO THE EXISTING COMPILED MODULE.
-2.IT SHOULD CLOSE THE ( Cache Incoherence & Stale Reads) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
-3.IT SHOULD ONLY ALTER CODE THAT  (Cache Incoherence & Stale Reads) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
+DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND PROVIDE A MITIGATION PATCH THAT FOLLOWS BELOW RULES 100% UNCONDITIONALY
+1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12, then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19, then patch 20, then patch 21,then patch 22,then patch 23,then patch 24, then patch 25,then patch 26,then patch 27,then patch 28,then patch 29,then patch 30,then patch 31)TO THE EXISTING COMPILED MODULE.
+2.IT SHOULD CLOSE THE ( Overstay / Expiry Race) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
+3.IT SHOULD ONLY ALTER CODE THAT  (Overstay / Expiry Race) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
 4.NO RUNTIME CRONS/CLEANERS/PERIODIC SCHEDULER ONLY ONE BOOT JANITOR THAT CAN RECOVER THE SYSYEM IN WHATEVER STATE IT WAS BEFORE FULL BOT OUTAGE
 5.LET THE SYTEM HANDLE ITSELF IF THERE IS A TIMEOUT, ERROR, CRASH 
 6.IF A PROCESS CANT HANDLE ITSELF DURING UPTIME THEN IT SHOULD BE HANDLED BY BOOT RWECOVERY DURING A FULL BOT RESTART
-7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( Cache Incoherence & Stale Reads) bug (if it exists) NO OTHER CASES
+7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( Overstay / Expiry Race) bug (if it exists) NO OTHER CASES
 
-WARNING!! DO NOT RESEND THE PATCH IF ALL 7 RULES ARE FOLLOWED AND THERE IS LITERALLY ZERO CODE CHANGE FROM WHAT I HAVE BELOW
-                   
-IF THE PATCH BELOW DOES NOT FOLLOW ALL 7 RULES  TELL ME EXACTLY WHAT RULE HAS BEEN BROKEN, STATE THE EXACT CODE FROM THE PATCH BELOW AND WHAT NEEDS TO CHANGE FROM THE PATCH BELOW , THEN UPDATE IT AND RESEND THE PATCH,DO NOT USE PLACEHOLDERS LIKE "KEEP PREVIOUS PATCH SUGGESTION"AND DO NOT PUT REFERENCE TO OLD CODE FROM THE OLD PATCH THAT I DISCARDED ENTIRELY.AND AFTER GENERATING NEW PATCH STATE EXACT CODE LINES  THAT CHANGED FROM PREVIOUS PATCH BELOW
-
-WRITE OUT THE  UPDATED PATCH FULLY EVEN  WITH THE CODE  THAT DID NOT CHANGE FROM PREVIOUS PATCH BELOW
