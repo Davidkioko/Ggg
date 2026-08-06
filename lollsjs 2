@@ -6924,24 +6924,228 @@ PATCH 26
 -ALBY_RPS = int(os.getenv("ALBY_RPS", "10" if IS_PAID else "3"))
 +ALBY_RPS = int(os.getenv("ALBY_RPS", "40" if IS_PAID else "3"))p
 
+PATCH 27
 
-I WANT YOU TO CHECK IF BELOW BUG ( Resource & DoS Vectors)  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is sequentially patch 1 then patch 2,then patch 3, then patch 4, then patch 5, then patch 6, then patch 7,then PATCH 8,then PATCH 9,then patch 10,then patch 11,then patch 12,then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19,then patch 20,then patch 21,then patch 22,then patch 23,then patch 24,then patch 25, then patch 26) ON THE COMPILED MODULES
+--- a/modules/callbacks_ui.py
++++ b/modules/callbacks_ui.py
+@@ -XX,XX +XX,XX @@ _MENU_COALESCE = {}
+ _PENDING_DELETE = {}
+ _redis_cb = None
+ _menu_coalesce_lock = asyncio.Lock()
+ _pending_delete_lock = asyncio.Lock()
++# Hard upper bounds (self-evicting).  No background cleaner.
++# Values chosen high enough for normal paid-tier traffic yet
++# low enough that a single process cannot be forced into
++# multi-GB dict growth.
++MENU_COALESCE_MAX = 50_000
++PENDING_DELETE_MAX = 20_000
+ CB_RATE_WINDOW_SEC = 10
+ CB_RATE_MAX = 8
+ 
+ async def _get_redis_cb():
+     ...
+ 
++def _bounded_set(d: dict, key, value, max_size: int):
++    """Insert / update and, if over capacity, drop the oldest entry.
++    Plain dict + pop(next(iter())) is sufficient (CPython ≥ 3.7 /
++    PyPy preserve insertion order).  No background cleaner."""
++    d[key] = value
++    if len(d) > max_size:
++        try:
++            d.pop(next(iter(d)))
++        except (StopIteration, RuntimeError):
++            pass
++
+ def uid_lock(func):
+     ...
+ 
+ async def vanish_and_send(client, query, photo_key, caption, markup):
+     uid = query.from_user.id
+     now = time.time()
+-    last_ts = _MENU_COALESCE.get(uid, 0)
+-    if now - last_ts < 1.0:
+-        return
+-    _MENU_COALESCE[uid] = now
++    async with _menu_coalesce_lock:
++        last_ts = _MENU_COALESCE.get(uid, 0)
++        if now - last_ts < 1.0:
++            return
++        _bounded_set(_MENU_COALESCE, uid, now, MENU_COALESCE_MAX)
+     ...
+     # (existing menu deletion / send logic unchanged)
+ 
+@@ -XX,XX +XX,XX @@ async def gate_guard(...):
+                     if ids:
+-                        _PENDING_DELETE[uid] = _PENDING_DELETE.get(uid, []) + ids
++                        async with _pending_delete_lock:
++                            cur = _PENDING_DELETE.get(uid, [])
++                            cur.extend(ids)
++                            _bounded_set(_PENDING_DELETE, uid, cur, PENDING_DELETE_MAX)
+                         u.menu_msg_ids = json.dumps([])
 
-Resource & DoS Vectors
-1. MENU_COALESCE and various dict-based caches are not bounded → memory pressure on long-running bot.
+--- a/modules/callbacks_payment.py
++++ b/modules/callbacks_payment.py
+@@ -XX,XX +XX,XX @@ async def cb_buy(_, query: CallbackQuery):
+     uid = query.from_user.id
+     now = time.time()
+     async with _menu_coalesce_lock:
+         last_ts = _MENU_COALESCE.get(uid, 0)
+         if now - last_ts < 0.5:
+             await query.answer("Processing...", show_alert=False)
+             return
+-        _MENU_COALESCE[uid] = now
++        from modules.callbacks_ui import _bounded_set, MENU_COALESCE_MAX
++        _bounded_set(_MENU_COALESCE, uid, now, MENU_COALESCE_MAX)
+
+--- a/modules/gatekeeper.py
++++ b/modules/gatekeeper.py
+@@ -XX,XX +XX,XX @@ _GATE_CACHE = {"value": None, "id": None, "ts": 0}
+ _CHATMEM_CACHE = {}
+ CACHE_TTL_GATE = 1800
+ CACHE_TTL_CHATMEM = 30
+ _gate_cache_lock = asyncio.Lock()
+ _chatmem_cache_lock = asyncio.Lock()
++# Bound the membership cache.  Entries older than TTL are dropped on
++# access; the hard size cap protects against a flood of distinct UIDs
++# inside a single TTL window.
++CHATMEM_CACHE_MAX = 30_000
++
++def _chatmem_set(key, status, now):
++    _CHATMEM_CACHE[key] = (status, now)
++    if len(_CHATMEM_CACHE) > CHATMEM_CACHE_MAX:
++        try:
++            _CHATMEM_CACHE.pop(next(iter(_CHATMEM_CACHE)))
++        except (StopIteration, RuntimeError):
++            pass
++
+ async def check_gate(client, uid):
+     ...
+     key = (gate_id, uid)
+     async with _chatmem_cache_lock:
+         if key in _CHATMEM_CACHE:
+             status, ts = _CHATMEM_CACHE[key]
+             if now - ts < CACHE_TTL_CHATMEM:
+                 return status in ["member", "administrator", "creator"]
+-            # else fall through and refresh
++            else:
++                # Lazy TTL prune
++                del _CHATMEM_CACHE[key]
+     try:
+         async with tg_semaphore:
+             member = await client.get_chat_member(gate_id, uid)
+         status = member.status
+         async with _chatmem_cache_lock:
+-            _CHATMEM_CACHE[key] = (status, now)
++            _chatmem_set(key, status, now)
+         return status in ["member", "administrator", "creator"]
+     except:
+         async with _chatmem_cache_lock:
+-            _CHATMEM_CACHE[key] = ("left", now)
++            _chatmem_set(key, "left", now)
+         return False
+
+--- a/modules/tokens.py
++++ b/modules/tokens.py
+@@ -XX,XX +XX,XX @@ _uid_locks: dict[int, asyncio.Lock] = {}
+ _global_lock = asyncio.Lock()
+ _redis_tok = None
++# Soft bound on the per-UID lock map.  Locks are cheap; the dict itself
++# is the growth surface.  On overflow we simply discard the oldest
++# entry – a concurrent caller for that UID will re-create the lock.
++UID_LOCKS_MAX = 40_000
++
+ async def _get_uid_lock(uid: int) -> asyncio.Lock:
+     async with _global_lock:
+         if uid not in _uid_locks:
+             _uid_locks[uid] = asyncio.Lock()
++        if len(_uid_locks) > UID_LOCKS_MAX:
++            try:
++                _uid_locks.pop(next(iter(_uid_locks)))
++            except (StopIteration, RuntimeError):
++                pass
+         return _uid_locks[uid]
+
+--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -XX,XX +XX,XX @@ async def _handle_expiry(uid, chat_id, db: AsyncSession):
+         ...
+         if ids_to_delete:
+-            _PENDING_DELETE[uid] = _PENDING_DELETE.get(uid, []) + ids_to_delete
++            from modules.callbacks_ui import _bounded_set, PENDING_DELETE_MAX, _pending_delete_lock
++            async with _pending_delete_lock:
++                cur = _PENDING_DELETE.get(uid, [])
++                cur.extend(ids_to_delete)
++                _bounded_set(_PENDING_DELETE, uid, cur, PENDING_DELETE_MAX)
+         ...
+ 
+@@ -XX,XX +XX,XX @@ async def check_inactivity(db: AsyncSession):
+         ...
+         if ids:
+-            _PENDING_DELETE[u.uid] = _PENDING_DELETE.get(u.uid, []) + ids
++            from modules.callbacks_ui import _bounded_set, PENDING_DELETE_MAX, _pending_delete_lock
++            async with _pending_delete_lock:
++                cur = _PENDING_DELETE.get(u.uid, [])
++                cur.extend(ids)
++                _bounded_set(_PENDING_DELETE, u.uid, cur, PENDING_DELETE_MAX)
+         ...
+ 
+ # EXPIRING_SOON_SET needs no change – already pruned on every successful
+ # expiry / kick path and is bounded by the number of concurrently
+ # active packages.
+
+
+PATCH 28
+
+--- a/modules/tg_api.py
++++ b/modules/tg_api.py
+@@ -XX,XX +XX,XX @@ async def batch_delete_messages(client, chat_id, msg_ids):
+     if not msg_ids:
+         return
++    # Hard ceiling – protects against unbounded menu_msg_ids / _PENDING_DELETE
++    # lists. Excess IDs are dropped (best-effort delete of the first MAX).
++    # No background cleaner; the bound is enforced on every call.
++    MAX_BATCH_DELETE = 2_000
++    if len(msg_ids) > MAX_BATCH_DELETE:
++        msg_ids = msg_ids[:MAX_BATCH_DELETE]
+     chunks = [msg_ids[i:i+100] for i in range(0, len(msg_ids), 100)]
+     for chunk in chunks:
+         await safe_call(client.delete_messages, chat_id, chunk)
+         await asyncio.sleep(0.1) # spread load
+
+--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -XX,XX +XX,XX @@ async def batch_delete_messages(client, chat_id, msg_ids):
+     if not msg_ids: return
++    # Same hard ceiling as tg_api (keeps both implementations identical).
++    # No background cleaner; the bound is enforced on every call.
++    MAX_BATCH_DELETE = 2_000
++    if len(msg_ids) > MAX_BATCH_DELETE:
++        msg_ids = msg_ids[:MAX_BATCH_DELETE]
+     chunks = [msg_ids[i:i+100] for i in range(0, len(msg_ids), 100)]
+     for chunk in chunks:
+         async with tg_semaphore:
+             try:
+                 await client.delete_messages(chat_id, chunk)
+             except: pass
+         await asyncio.sleep(0.1)
+
+I WANT YOU TO CHECK IF BELOW BUG ( Cache Incoherence & Stale Reads)  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is sequentially patch 1 then patch 2,then patch 3, then patch 4, then patch 5, then patch 6, then patch 7,then PATCH 8,then PATCH 9,then patch 10,then patch 11,then patch 12,then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19,then patch 20,then patch 21,then patch 22,then patch 23,then patch 24,then patch 25, then patch 26,then patch 27, then patch 28) ON THE COMPILED MODULES
+
+Cache Incoherence & Stale Reads
+1. _GATE_CACHE, _PREMIUM_CACHE, _REFERRAL_CACHE, _INVITE_CACHE have no invalidation on admin changes except manual calls in specific admin commands.
 
 WARNING!!THIS IS A DRY RUN, SPECULATIVE EXECUTION, PREFLIGHT VALIDATION, WE ARE TESTING THE PATCH BELOW  IF IT WILL APPLY CLEANLY TO CODEBASE WITHOUT MODIFYING ACTIVE PROJECT FILES. MY COMPILED CODE HAS NOT BEEN PATCHED YET, THE PATCH IS A SUGESTION OF WHAT I SHOULD DO
 
-IF THE BUG (Resource & DoS Vectors) EXISTS:
+IF THE BUG (Cache Incoherence & Stale Reads) EXISTS:
 
-DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND  CHECK PROVIDED MITIGATION PATCH IF IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
-1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12, then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19, then patch 20, then patch 21,then patch 22,then patch 23,then patch 24, then patch 25,then patch 26)TO THE EXISTING COMPILED MODULE.
-2.IT SHOULD CLOSE THE ( Resource & DoS Vectors) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
-3.IT SHOULD ONLY ALTER CODE THAT  (Resource & DoS Vectors) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
+DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND CHECK PROVIDED MITIGATION PATCH IF IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
+1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12, then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19, then patch 20, then patch 21,then patch 22,then patch 23,then patch 24, then patch 25,then patch 26,then patch 27,then patch 28)TO THE EXISTING COMPILED MODULE.
+2.IT SHOULD CLOSE THE ( Cache Incoherence & Stale Reads) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
+3.IT SHOULD ONLY ALTER CODE THAT  (Cache Incoherence & Stale Reads) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
 4.NO RUNTIME CRONS/CLEANERS/PERIODIC SCHEDULER ONLY ONE BOOT JANITOR THAT CAN RECOVER THE SYSYEM IN WHATEVER STATE IT WAS BEFORE FULL BOT OUTAGE
 5.LET THE SYTEM HANDLE ITSELF IF THERE IS A TIMEOUT, ERROR, CRASH 
 6.IF A PROCESS CANT HANDLE ITSELF DURING UPTIME THEN IT SHOULD BE HANDLED BY BOOT RWECOVERY DURING A FULL BOT RESTART
-7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( Resource & DoS Vectors) bug (if it exists) NO OTHER CASES
+7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( Cache Incoherence & Stale Reads) bug (if it exists) NO OTHER CASES
 
 WARNING!! DO NOT RESEND THE PATCH IF ALL 7 RULES ARE FOLLOWED AND THERE IS LITERALLY ZERO CODE CHANGE FROM WHAT I HAVE BELOW
                    
