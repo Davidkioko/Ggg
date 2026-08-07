@@ -8081,6 +8081,115 @@ PATCH 35
 
 
 
-NOW AFTER IMPLEMENTATION OF THE PATCHES IN ORDER. PERFORM A RIGOROUS FULL IN DEPTH ANALYSIS AND REVIEW OF A PREFLIGHT VALIDATION,SPECULATIVE EXECUTION A DRY RUN AND STATE WHAT ROOT CAUSE GROUP  FROM BELOW  HAS BEEN MITIGATED 100% WITH ABSOLUTE NO REMAINING EDGE CASES FROM IT
+NOW AFTER IMPLEMENTATION OF THE PATCHES IN ORDER. PERFORM A RIGOROUS FULL IN DEPTH ANALYSIS AND REVIEW OF A PREFLIGHT VALIDATION,SPECULATIVE EXECUTION A DRY RUN AND
+1.STATE WHAT ROOT CAUSE GROUP  FROM BELOW  HAS BEEN MITIGATED 100% AND ALL REMAINING EGDE CASES ARE RESOLVED ON BOOT/RESTART
+
+[ROOT CAUSE GROUP 02] IMPORT PATH / MODULE RESOLUTION CHAOS + DUPLICATE DEFINITIONS
+  config vs modules.config_loader vs core.* vs db.db vs db.models — every module invents its own import style.
+  MODULE 02 imports from config and later modules import from modules.config_loader for the same symbols.
+  MODULE 09 imports from core.logger / core.bot while MODULE 04 is logger_utils and MODULE 07 is bot_init.
+  MODULE 11 imports REDIS_HOST from modules.config_loader while other modules pull it from config.
+  MODULE 15/16 import kick / premium / tokens with inconsistent package prefixes.
+  MODULE 22 imports core.handlers that is never defined in the provided modules.
+  MODULE 23 imports from utils.constants and config.WEBHOOK_SECRET while the secret lives in modules.config_loader / os.getenv.
+  Circular and missing modules will raise ImportError / ModuleNotFoundError at startup.
+  kick_with_fallback defined in MODULE 09 and again in MODULE 18 with slightly different admin checks.
+  get_ref_owner_from_link defined in MODULE 15 and again in MODULE 16.
+  batch_delete_messages defined in MODULE 09, MODULE 24A, MODULE 26.
+  retry_with_jitter defined in MODULE 04 and again in MODULE 24B.
+  ping_self defined in MODULE 10 and again in MODULE 22.
+  _parse_channel_id appears in MODULE 15, 16, 19 with different cache behaviour.
+  Import order determines which definition wins; silent behavioural divergence.
+
+[ROOT CAUSE GROUP 03] SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS
+  MODULE 05 set_state uses async with db.begin() then sets last_activity = func.now() (SQL expression object, not evaluated).
+  MODULE 11 add_tokens / deduct_tokens: own_session path does async with db.begin() inside a for-retry loop while the session object is created outside; close happens in finally but begin() may leave the session in a dirty state on exception.
+  MODULE 13 activate_package: nested begin() + with_for_update + OCC retry inside a single session that may already be in a transaction.
+  MODULE 17B create_invoice: two separate sessions — one inserts payment_version=1, second attaches invoice; race window between them.
+  MODULE 23 alby_webhook: multiple sequential begin() blocks on the same SessionLocal instance; after first begin the second begin raises InvalidRequestError or silently fails depending on driver.
+  MODULE 26 recover_and_finalize_boot: opens many independent SessionLocal() contexts while the caller also holds a session; nested begin() + with_for_update across sessions produces lock contention and lost updates.
+  Many places do db.get() then later db.execute(update) without ensuring the object is still attached or the transaction is open.
+  MODULE 11 _add_tokens_inner: for-loop over OCC_RETRIES, on success break, else after loop return False; however the payment finalization update is outside the OCC loop and can fail independently, leaving tokens credited but payment not marked.
+  MODULE 11 deduct_tokens: isolation_level="SERIALIZABLE" set via execution_options on a select(1) which does not actually change the transaction isolation for subsequent statements in all SQLAlchemy/asyncpg versions.
+  MODULE 13 activate_package: double OCC loop (outer attempt + inner retry) both using the same with_for_update row; version check can be stale between the two levels.
+  MODULE 16 credit_referral: similar double OCC + referral_earned_today check; can overshoot DAILY_REF_CAP under concurrent credits.
+  balance_version is incremented only on successful rowcount==1, but many call sites ignore the False return and proceed as if tokens moved.
+  Payment states: reserving / awaiting_payment / open / paid / dead. Multiple modules transition with different version numbers.
+  MODULE 17B inserts state='awaiting_payment', payment_version=1.
+  MODULE 23 webhook forces reserving→open or awaiting→open with version 1→2, then calls add_tokens which forces version 3 and paid=True.
+  MODULE 26 recovery has three separate phases that re-read and re-write the same rows with overlapping version predicates; a payment can be marked dead in phase 2 while phase 3 still tries to credit it.
+  UniqueConstraint uq_one_unpaid_invoice and Index uq_uid_payment_v1 use postgresql_where clauses that do not cover all transitional states, allowing two unpaid rows under race.
+  CheckConstraint ck_state_mutation_authority and ck_invoice_single_writer are violated by recovery paths that write invoice_id while version is still 1.
+
+[ROOT CAUSE GROUP 04] REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES
+  MODULE 11 maintains _uid_locks dict + Redis side-effect keys; locks are process-local only.
+  MODULE 24A uid_lock decorator uses Redis NX lock with TTL; MODULE 24B lock_user_for_buy uses DB column invoice_lock_until.
+  Three independent locking mechanisms (in-memory asyncio.Lock, Redis key, DB timestamp) never coordinate; concurrent buy + credit + package activation can interleave.
+  Caches (_GATE_CACHE, _PREMIUM_CACHE, _REF_LINK_CACHE, _GIF_CACHE, _PRICE_CACHE, EXPIRING_SOON_SET) are process-local; multi-worker or restart loses them or serves stale data.
+  MODULE 14 start_cache_clear spawns a task that clears caches but is never scheduled from MODULE 22 entry.
+  MODULE 16 ref_links / _REF_LINK_CACHE recovered from Settings but never cleaned of expired entries except in a background loop that may not be started.
+  MODULE 12 _GATE_CACHE and _CHATMEM_CACHE are global dicts with TTL; concurrent gate_check calls can race on write.
+  Cache stores status string; after kick the cache still returns “member” until TTL expires, allowing expired users to keep interacting.
+  setgate1 clears only part of the cache; other processes keep the old id.
+  check_gate returns False on any exception, treating network blips as “left channel”.
+
+[ROOT CAUSE GROUP 05] TELEGRAM API WRAPPER & RATE-LIMIT SURFACE
+  MODULE 09 safe_call swallows all exceptions after retries and returns None; callers treat None as success or failure inconsistently.
+  kick_with_fallback (MODULE 09 and MODULE 18 duplicate) checks member status after ban; race with Telegram’s eventual consistency means false “still present”.
+  batch_delete_messages chunks to 100 but never handles FloodWait or message-not-found errors beyond the generic safe_call.
+  MODULE 07 Client max_concurrent / workers / sleep_threshold are set from tier but tg_semaphore is a separate asyncio.Semaphore; the two limits fight each other.
+  Many places call client.send_* / delete_messages / ban_chat_member without the semaphore or with nested semaphore acquisition, risking deadlock under load.
+
+[ROOT CAUSE GROUP 06] TIMEZONE / DATETIME AWARENESS MISMATCHES
+  Some modules use datetime.now(timezone.utc), others use func.now() (DB server time), others use naive datetime.
+  package_end comparisons mix aware and naive; can raise TypeError or silently compare wrong.
+  MODULE 15/16 referral expiry uses fromisoformat without always guaranteeing tzinfo.
+  MODULE 26 OVERSTAY_MAX_SEC / INACTIVITY_DELETE_SEC windows use aware now but last_activity may be stored as naive depending on column default.
+  invoice_lock_until and expires_at are compared without consistent tz.
+
+[ROOT CAUSE GROUP 07] HARD-CODED / MISSING CONFIG & ENVIRONMENT ASSUMPTIONS + HTTP RESOURCE LEAKS
+  MODULE 01 loads dotenv then reads many os.getenv with defaults; critical secrets (API_ID, API_HASH, BOT_TOKEN, ALBY_TOKEN) have no fallback and will crash on int()/None.
+  ADMIN_IDS split on empty string yields empty list; filters.user([]) behaves unexpectedly.
+  MODULE 23 WEBHOOK_SECRET vs ALBY_WEBHOOK_SECRET vs os.getenv — three possible sources, none guaranteed.
+  DB_URL defaults to pgbouncer:6432; pool settings assume PgBouncer transaction mode but SQLAlchemy async engine with pool_pre_ping + SERIALIZABLE is incompatible with transaction pooling.
+  REDIS_HOST default “redis” assumes Docker service name; no connection retry or health check.
+  MODULE 02 get_http creates a single global ClientSession with WEBHOOK_TIMEOUT; all Alby and self-ping calls share it.
+  close_http is only called on process exit; under long-running process the connector limit can be exhausted.
+  MODULE 17A/17B alby_semaphore is created twice (once per module) with the same ALBY_RPS value; two independent semaphores double the allowed concurrency.
+  aiohttp timeout is set only on ClientSession construction; individual requests that pass a different timeout are ignored or raise.
+  MODULE 10/22 ping_self swallows all exceptions; health endpoint can be down indefinitely with no alert.
+
+[ROOT CAUSE GROUP 08] REFERRAL & INVITE LINK LIFECYCLE BUGS
+  MODULE 16 gen_link creates Telegram invite with expire_date but also stores a separate Settings key with its own expiry; the two can drift.
+  credit_referral and on_join_complete both attempt to set referred_by and credit tokens; double-credit possible under concurrent join events.
+  ref_maintenance_loop deletes expired Settings but never cancels the corresponding Telegram invite link.
+  MODULE 15 handle_join_request approves referral channel unconditionally; no check that the join came from a valid ref link.
+  Daily cap and lifetime counters are updated without a single atomic transaction covering both the new user and the owner in all paths.
+
+[ROOT CAUSE GROUP 09] BOOT / RECOVERY / SCHEDULER ORDERING
+  MODULE 22 sets SYSTEM_LOCKED=True, runs recover_and_finalize_boot, then sets False; any handler that fires during the window sees locked state, but webhook server is started after unlock.
+  recover_and_finalize_boot never schedules the periodic jobs (check_expiry, check_overstay, check_inactivity, reset_referrals, ref_maintenance_loop); they are defined but never added to the scheduler.
+  EXPIRING_SOON_SET is populated at boot then only mutated by add_expiring_user; if a package is activated while the set is being iterated in check_expiry, RuntimeError or missed expiry occurs.
+  BOOT_LOCK_KEY Redis key is set with RECOVERY_MAX_RUNTIME_SEC but the recovery itself has no overall timeout; a hung Alby call can leave the key stuck until TTL.
+
+[ROOT CAUSE GROUP 10] STANDALONE
+  MODULE 03: payment_no_double_credit trigger uses EXECUTE FUNCTION (Postgres 14+) vs EXECUTE PROCEDURE; older servers fail.
+  MODULE 03: UniqueConstraint postgresql_where references paid / tokens_credited / state before the columns are fully defined in some SQLAlchemy versions.
+  MODULE 05: get_state returns “gate1” for missing user but set_state creates the user; race on first message.
+  MODULE 08: load_gif_cache and get_gif race on _GIF_CACHE without lock.
+  MODULE 11: side_effect_key Redis set happens after successful credit but only when own_session=True; external-session callers never set the key.
+  MODULE 12: add_tokens called with db=db inside a begin() block; if add_tokens opens its own begin it nests incorrectly.
+  MODULE 13: can_buy does not take a lock; two concurrent can_buy + activate can both succeed.
+  MODULE 19: /post broadcasts to every uid with no rate-limit beyond a crude sleep every 20; will hit Telegram flood limits.
+  MODULE 19: earnings uses func.date() which is timezone-sensitive and may shift “today”.
+  MODULE 20: main_menu etc. return InlineKeyboardMarkup but vanish_and_send sometimes sends photo=False then later send_animation; double messages.
+  MODULE 23: tokens_to_credit recalculated from amount_usd * TOKENS_PER_USD then overwritten by payment.tokens; mismatch if price changed.
+  MODULE 24A: vanish_and_send deletes the callback message then sends both a text and an animation; user receives two menus.
+  MODULE 24B: create_invoice result is unpacked then client_ref is re-fetched; if the row was deleted in between, None is used.
+  MODULE 26: check_expiry iterates EXPIRING_SOON_SET while other coroutines mutate it; can raise RuntimeError: set changed size during iteration.
+  MODULE 26: _handle_expiry calls set_state which itself opens a new session while the caller already holds a transaction.
+  MODULE 01: BOT_TIER default “free” but many limits are hard-coded; changing env after import has no effect because values are computed at module load.
+  MODULE 02: engine and async_engine are the same object; later code treats them as distinct.
+  MODULE 07: Client is created at import time; any missing API_ID/API_HASH crashes the whole process before main().
 
 
