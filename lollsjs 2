@@ -8530,7 +8530,778 @@ PATCH 36
 -    except:
 -        return None
 
-I WANT YOU TO CHECK IF BELOW BUG ( SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) EXISTS ONLY AFTER APPLYING THE  PATCHES ABOVE SEQUENTIALLY.
+
+PATCH 37
+
+--- a/modules/state_manager.py
++++ b/modules/state_manager.py
+@@ -1,20 +1,28 @@
+ from db.db import SessionLocal
+ from db.models import User
+-from sqlalchemy import select, func
++from sqlalchemy import select, update
++from datetime import datetime, timezone
+ 
+-async def set_state(uid, state):
+-    async with SessionLocal() as db:
+-        async with db.begin():
+-            u = await db.get(User, uid)
+-            if not u:
+-                u = User(uid=uid)
+-                db.add(u)
+-            u.state = state
+-            u.last_activity = func.now()
++async def set_state(uid, state, db=None):
++    """Single-transaction state write. last_activity is always a concrete UTC timestamp."""
++    now = datetime.now(timezone.utc)
++    own = db is None
++    if own:
++        db = SessionLocal()
++    try:
++        async with db.begin():
++            res = await db.execute(
++                update(User)
++                .where(User.uid == uid)
++                .values(state=state, last_activity=now)
++                .returning(User.uid)
++            )
++            if res.scalar_one_or_none() is None:
++                db.add(User(uid=uid, state=state, last_activity=now))
++    finally:
++        if own:
++            await db.close()
+ 
+ async def get_state(uid):
+     async with SessionLocal() as db:
+         u = await db.get(User, uid)
+         return u.state if u else "gate1"
+ 
+ if __name__ != "__main__":
+     print("[MODULE 05 - STATE_MANAGER] Loaded v1.0.4")
+diff--- a/modules/tokens.py
++++ b/modules/tokens.py
+@@ -XX,XX +XX,XX @@ async def _add_tokens_inner(uid, amount, payment_id: int = None, job_id: int = None, db: AsyncSession = None, reason: str = 'payment', invoice_id=None, payment_request=None, expires_at=None):
+     now = datetime.now(timezone.utc)
+     if payment_id is not None:
+         if reason not in ['admin', 'recovery']:
+             raise RuntimeError("Only MODULE 26 / webhook / admin can finalize payments")
+         stmt_lock_payment = select(Payment).where(Payment.id == payment_id).with_for_update()
+         result_lock_p = await db.execute(stmt_lock_payment)
+         payment = result_lock_p.scalar_one_or_none()
+         if payment is None:
+             return False
+         if payment.tokens_credited:
+             return True
+     for attempt in range(OCC_RETRIES):
+         if attempt == OCC_RETRIES - 1:
+             logger.warning("OCC contention: _add_tokens_inner final retry attempt=%s for uid=%s amount=%s", attempt, uid, amount)
+         res_user = await db.execute(select(User.balance_version).where(User.uid == uid).with_for_update())
+         row = res_user.first()
+         if row is None:
+             stmt_ins = insert(User).values(uid=uid, tokens=amount, balance_version=1)
+             result = await db.execute(stmt_ins)
+             if result.rowcount == 1:
+                 break
+             await asyncio.sleep(random.uniform(0.02 * (2 ** attempt), 0.06 * (2 ** attempt)))
+             continue
+         else:
+             expected_version = row[0]
+             stmt = (update(User).where(User.uid == uid, User.balance_version == expected_version).values(tokens=User.tokens + amount, balance_version=User.balance_version + 1))
+             result = await db.execute(stmt)
+             if result.rowcount == 1:
+                 break
+             await asyncio.sleep(random.uniform(0.02 * (2 ** attempt), 0.06 * (2 ** attempt)))
+     else:
+         return False
+     # FINALIZATION IS INSIDE THE SAME CRITICAL SECTION – no tokens-without-paid row
+     if payment_id is not None:
+         stmt_finalize = (
+             update(Payment)
+             .where(
+                 Payment.id == payment_id,
+                 Payment.tokens_credited == False,
+                 Payment.payment_version.in_([1, 2, 4]),
+             )
+             .values(
+                 paid=True,
+                 tokens_credited=True,
+                 credited_at=now,
+                 paid_at=now,
+                 state='paid',
+                 payment_version=3,
+                 invoice_id=invoice_id or Payment.invoice_id,
+                 payment_request=payment_request or Payment.payment_request,
+                 expires_at=expires_at or Payment.expires_at,
+             )
+         )
+         result = await db.execute(stmt_finalize)
+         if result.rowcount != 1:
+             return False
+     return True
+ 
+ async def add_tokens(uid, amount, payment_id: int = None, job_id: int = None, db: AsyncSession = None, reason: str = 'payment',
+                      invoice_id=None, payment_request=None, expires_at=None):
+     """
+     Single authoritative credit path.
+     - When payment_id is supplied the caller MUST pass an already-open transaction (db).
+       In that case we never call begin() ourselves.
+     - own_session path creates a *fresh* session on every attempt and owns the transaction.
+     - Balance + payment finalization always occur under one SERIALIZABLE transaction
+       and one uid lock. No intermediate state is visible.
+     """
+     if payment_id is not None and db is None:
+         raise ValueError("add_tokens requires external db session when payment_id is provided")
+     r = await _get_redis_tok()
+     side_effect_key = f"vip:side:payment:{payment_id}" if payment_id else f"vip:side:admin:{uid}:{amount}"
+     max_attempts = OCC_RETRIES
+     for attempt in range(max_attempts):
+         own_session = False
+         session = None
+         if db is None:
+             own_session = True
+             session = SessionLocal()
+         else:
+             session = db
+         try:
+             if attempt > 0:
+                 await asyncio.sleep(random.uniform(0.03, 0.10))
+             if own_session:
+                 async with session.begin():
+                     await session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+                     uid_lock = await _get_uid_lock(uid)
+                     async with uid_lock:
+                         ok = await _add_tokens_inner(
+                             uid, amount, payment_id, job_id, session, reason,
+                             invoice_id=invoice_id,
+                             payment_request=payment_request,
+                             expires_at=expires_at,
+                         )
+                         if ok:
+                             if payment_id is None and reason == 'admin':
+                                 now = datetime.now(timezone.utc)
+                                 stmt = insert(Payment).values(
+                                     uid=uid, amount_usd=0, tokens=amount,
+                                     paid=True, tokens_credited=True,
+                                     credited_at=now, paid_at=now,
+                                     client_ref=f'admin_add_{uuid.uuid4().hex}',
+                                     state='paid', payment_version=3,
+                                 ).returning(Payment.id)
+                                 await session.execute(stmt)
+                             if payment_id:
+                                 try:
+                                     await r.set(side_effect_key, "1", nx=True, ex=86400)
+                                 except Exception:
+                                     pass
+                             return True
+             else:
+                 # External transaction already open – never begin() again.
+                 uid_lock = await _get_uid_lock(uid)
+                 async with uid_lock:
+                     ok = await _add_tokens_inner(
+                         uid, amount, payment_id, job_id, session, reason,
+                         invoice_id=invoice_id,
+                         payment_request=payment_request,
+                         expires_at=expires_at,
+                     )
+                     if ok:
+                         return True
+         except DBAPIError as e:
+             if attempt == max_attempts - 1:
+                 raise
+             if getattr(e.orig, 'pgcode', None) == '40001':
+                 continue
+             continue
+         finally:
+             if own_session and session is not None:
+                 await session.close()
+     return False
+ 
+ async def deduct_tokens(uid, amount, idempotency_key: str = None, db: AsyncSession = None):
+     """Mirror of add_tokens – fresh session per attempt when we own it, true SERIALIZABLE, single OCC."""
+     max_attempts = OCC_RETRIES
+     for attempt in range(max_attempts):
+         own_session = False
+         session = None
+         if db is None:
+             own_session = True
+             session = SessionLocal()
+         else:
+             session = db
+         try:
+             if own_session:
+                 async with session.begin():
+                     await session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+                     uid_lock = await _get_uid_lock(uid)
+                     async with uid_lock:
+                         res = await session.execute(
+                             select(User.balance_version, User.tokens)
+                             .where(User.uid == uid)
+                             .with_for_update()
+                         )
+                         row = res.first()
+                         if not row or row[1] < amount:
+                             return False
+                         expected_version, _ = row
+                         stmt = (
+                             update(User)
+                             .where(
+                                 User.uid == uid,
+                                 User.balance_version == expected_version,
+                                 User.tokens >= amount,
+                             )
+                             .values(
+                                 tokens=User.tokens - amount,
+                                 balance_version=User.balance_version + 1,
+                             )
+                         )
+                         result = await session.execute(stmt)
+                         if result.rowcount == 1:
+                             return True
+             else:
+                 uid_lock = await _get_uid_lock(uid)
+                 async with uid_lock:
+                     res = await session.execute(
+                         select(User.balance_version, User.tokens)
+                         .where(User.uid == uid)
+                         .with_for_update()
+                     )
+                     row = res.first()
+                     if not row or row[1] < amount:
+                         return False
+                     expected_version, _ = row
+                     stmt = (
+                         update(User)
+                         .where(
+                             User.uid == uid,
+                             User.balance_version == expected_version,
+                             User.tokens >= amount,
+                         )
+                         .values(
+                             tokens=User.tokens - amount,
+                             balance_version=User.balance_version + 1,
+                         )
+                     )
+                     result = await session.execute(stmt)
+                     if result.rowcount == 1:
+                         return True
+         except DBAPIError as e:
+             if attempt == max_attempts - 1:
+                 raise
+             continue
+         finally:
+             if own_session and session is not None:
+                 await session.close()
+     return False
+diff--- a/modules/packages.py
++++ b/modules/packages.py
+@@ -XX,XX +XX,XX @@ async def activate_package(uid, key, active_channel, db: AsyncSession = None):
+     # Single OCC loop, single transaction, true SERIALIZABLE.
+     # No nested begin(); caller may pass an open session or we own one.
+     # When we own the session a *fresh* SessionLocal is created on every attempt.
+     p = PACKAGES[key]
+     cost = p["cost"]
+     for attempt in range(OCC_RETRIES):
+         own_db = db is None
+         session = db
+         if own_db:
+             session = SessionLocal()
+         try:
+             if own_db:
+                 async with session.begin():
+                     await session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+                     res = await session.execute(
+                         select(func.count())
+                         .select_from(Payment)
+                         .where(
+                             Payment.uid == uid,
+                             Payment.state.in_(['awaiting_payment', 'open', 'reserving']),
+                             Payment.paid == False,
+                         )
+                     )
+                     if (res.scalar() or 0) > 0:
+                         return False
+                     if await is_user_locked_for_buy(uid, session):
+                         return False
+                     uid_lock = await _get_uid_lock(uid)
+                     async with uid_lock:
+                         res = await session.execute(
+                             select(User.balance_version, User.tokens, User.active_channel)
+                             .where(User.uid == uid)
+                             .with_for_update()
+                         )
+                         row = res.first()
+                         if not row or row[1] < cost or row[2] is not None:
+                             return False
+                         expected_version = row[0]
+                         now = datetime.now(timezone.utc)
+                         stmt = (
+                             update(User)
+                             .where(
+                                 User.uid == uid,
+                                 User.balance_version == expected_version,
+                                 User.tokens >= cost,
+                                 User.active_channel.is_(None),
+                             )
+                             .values(
+                                 tokens=User.tokens - cost,
+                                 balance_version=User.balance_version + 1,
+                                 active_package=key,
+                                 active_channel=active_channel,
+                                 package_end=now + timedelta(seconds=p["internal"]),
+                             )
+                         )
+                         res = await session.execute(stmt)
+                         if res.rowcount == 1:
+                             await add_expiring_user(uid, session)
+                             return True
+             else:
+                 # External transaction already open – never begin().
+                 res = await session.execute(
+                     select(func.count())
+                     .select_from(Payment)
+                     .where(
+                         Payment.uid == uid,
+                         Payment.state.in_(['awaiting_payment', 'open', 'reserving']),
+                         Payment.paid == False,
+                     )
+                 )
+                 if (res.scalar() or 0) > 0:
+                     return False
+                 if await is_user_locked_for_buy(uid, session):
+                     return False
+                 uid_lock = await _get_uid_lock(uid)
+                 async with uid_lock:
+                     res = await session.execute(
+                         select(User.balance_version, User.tokens, User.active_channel)
+                         .where(User.uid == uid)
+                         .with_for_update()
+                     )
+                     row = res.first()
+                     if not row or row[1] < cost or row[2] is not None:
+                         return False
+                     expected_version = row[0]
+                     now = datetime.now(timezone.utc)
+                     stmt = (
+                         update(User)
+                         .where(
+                             User.uid == uid,
+                             User.balance_version == expected_version,
+                             User.tokens >= cost,
+                             User.active_channel.is_(None),
+                         )
+                         .values(
+                             tokens=User.tokens - cost,
+                             balance_version=User.balance_version + 1,
+                             active_package=key,
+                             active_channel=active_channel,
+                             package_end=now + timedelta(seconds=p["internal"]),
+                         )
+                     )
+                     res = await session.execute(stmt)
+                     if res.rowcount == 1:
+                         await add_expiring_user(uid, session)
+                         return True
+         except DBAPIError as e:
+             if attempt < OCC_RETRIES - 1 and getattr(e.orig, 'pgcode', None) == '40001':
+                 await asyncio.sleep(random.uniform(0.02, 0.08))
+                 continue
+             raise
+         finally:
+             if own_db and session is not None:
+                 await session.close()
+     return False
+diff--- a/modules/payments_api.py
++++ b/modules/payments_api.py
+@@ -XX,XX +XX,XX @@ async def create_invoice(uid: int) -> tuple[str, str, int, float, int]:
+     """
+     Single transaction creates the Payment row in state='awaiting_payment'
+     with payment_version=1 AND attaches the Alby invoice_id in the same
+     critical section. No half-written row is ever visible.
+     The Alby call is performed *inside* the same SERIALIZABLE transaction
+     so that a concurrent caller cannot observe an incomplete row and so that
+     an orphaned Alby invoice cannot be left behind if the insert fails.
+     """
+     price_usd, tokens_per_usd = await _get_price_config()
+     amount_usd = price_usd
+     client_ref = str(uuid.uuid4())
+     now = datetime.now(timezone.utc)
+     async with SessionLocal() as db:
+         async with db.begin():
+             await db.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+             # Reject if any unpaid row already exists
+             res = await db.execute(
+                 select(Payment)
+                 .where(
+                     Payment.uid == uid,
+                     Payment.paid == False,
+                     Payment.tokens_credited == False,
+                     Payment.state.in_(["reserving", "awaiting_payment", "open"]),
+                 )
+                 .with_for_update()
+             )
+             existing = res.scalar_one_or_none()
+             if existing:
+                 if existing.payment_request and existing.invoice_id:
+                     return (
+                         existing.payment_request,
+                         existing.invoice_id,
+                         existing.id,
+                         float(existing.amount_usd),
+                         existing.tokens,
+                     )
+                 raise RuntimeError("Incomplete unpaid invoice already exists for this uid")
+             # Network *inside* the open transaction – lock is held only for the
+             # short Alby RTT; on any failure the transaction rolls back and no
+             # row (and therefore no orphaned invoice) is left.
+             s = await get_http()
+             async with alby_semaphore:
+                 r = await s.post(
+                     "https://api.getalby.com/invoices",
+                     headers={
+                         "Authorization": f"Bearer {ALBY_TOKEN}",
+                         "X-Idempotency-Key": client_ref,
+                     },
+                     json={
+                         "amount": amount_usd,
+                         "metadata": {
+                             "uid": uid,
+                             "tokens": tokens_per_usd,
+                             "client_ref": client_ref,
+                         },
+                     },
+                 )
+                 if r.status >= 400:
+                     raise RuntimeError(f"Alby invoice creation failed status {r.status}")
+                 data = await r.json()
+             stmt = (
+                 insert(Payment)
+                 .values(
+                     uid=uid,
+                     paid=False,
+                     amount_usd=amount_usd,
+                     tokens=tokens_per_usd,
+                     client_ref=client_ref,
+                     created=now,
+                     state='awaiting_payment',
+                     invoice_id=data["id"],
+                     payment_request=data["payment_request"],
+                     expires_at=data.get("expires_at"),
+                     payment_version=1,
+                 )
+                 .returning(Payment.id)
+             )
+             res = await db.execute(stmt)
+             pay_id = res.scalar_one()
+             return (
+                 data["payment_request"],
+                 data["id"],
+                 pay_id,
+                 amount_usd,
+                 tokens_per_usd,
+             )
+diff--- a/modules/webhook_server.py
++++ b/modules/webhook_server.py
+@@ -XX,XX +XX,XX @@ async def alby_webhook(request):
+     # ... signature / json parsing unchanged ...
+     payment_id_for_redis = None
+     uid_for_notify = None
+     tokens_to_credit = 0
+     async with SessionLocal() as db:
+         try:
+             async with db.begin():
+                 # 1. Audit (idempotent)
+                 await db.execute(text("""
+                     INSERT INTO payment_webhook_events (invoice_id, client_ref, payload, received_at)
+                     VALUES (:inv, :ref, :payload, :ts)
+                     ON CONFLICT (invoice_id) DO NOTHING
+                 """), {
+                     "inv": invoice_id,
+                     "ref": client_ref,
+                     "payload": json.dumps(data),
+                     "ts": datetime.now(timezone.utc),
+                 })
+                 # 2. True SERIALIZABLE for the credit decision
+                 await db.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+                 stmt = (
+                     select(Payment)
+                     .where(
+                         or_(
+                             Payment.invoice_id == invoice_id,
+                             Payment.client_ref == client_ref,
+                         )
+                     )
+                     .with_for_update()
+                 )
+                 res = await db.execute(stmt)
+                 payment = res.scalar_one_or_none()
+                 if not payment or payment.tokens_credited:
+                     return web.Response(status=200, text="ok")
+                 # Only the states that are allowed to become paid
+                 if payment.payment_version not in (1, 2, 4) or payment.paid:
+                     return web.Response(status=200, text="ok")
+                 # Single call that both credits tokens AND marks the payment.
+                 # add_tokens will NOT call begin() because we pass db.
+                 ok = await add_tokens(
+                     payment.uid,
+                     payment.tokens,
+                     payment_id=payment.id,
+                     reason='recovery',
+                     db=db,
+                     invoice_id=invoice_id,
+                     payment_request=getattr(payment, "payment_request", None),
+                     expires_at=getattr(payment, "expires_at", None),
+                 )
+                 if not ok:
+                     # Force rollback of any partial balance update.
+                     raise RuntimeError("add_tokens failed – leave for boot janitor")
+                 payment_id_for_redis = payment.id
+                 uid_for_notify = payment.uid
+                 tokens_to_credit = payment.tokens
+         except Exception as e:
+             log.error("webhook credit transaction failed for inv %s ref %s: %s",
+                       invoice_id, client_ref, e)
+             return web.Response(status=200, text="ok")
+     if uid_for_notify and payment_id_for_redis:
+         asyncio.create_task(_send_notify_messages(uid_for_notify, tokens_to_credit))
+         try:
+             r = await _get_redis()
+             await r.set(f"vip:side:payment:{payment_id_for_redis}", "1",
+                         nx=True, ex=IDEMPOTENCY_TTL)
+         except Exception:
+             pass
+     return web.Response(status=200, text="ok")
+diff--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -XX,XX +XX,XX @@ async def recover_and_finalize_boot(db: AsyncSession):
+     """
+     Single boot-time authority for every transitional Payment state.
+     Runs under the process-wide BOOT_LOCK_KEY (already held by entry.py).
+     All network (Alby) calls are performed *outside* any DB transaction.
+     Each phase uses a fresh SessionLocal so no nested begin() can occur.
+     Residual rows after any failure are left for the next boot.
+     """
+     # Phase 0 – clear expired invoice locks (idempotent)
+     async with SessionLocal() as phase_db:
+         async with phase_db.begin():
+             await phase_db.execute(
+                 text("UPDATE users SET invoice_lock_until=NULL WHERE invoice_lock_until < now()")
+             )
+     # Phase 1 – attach missing invoice_id for rows that Alby already knows
+     candidates = []
+     async with SessionLocal() as phase_db:
+         async with phase_db.begin():
+             res = await phase_db.execute(
+                 select(Payment)
+                 .where(
+                     Payment.state == 'awaiting_payment',
+                     Payment.invoice_id.is_(None),
+                     Payment.payment_version == 1,
+                 )
+                 .with_for_update()
+             )
+             candidates = list(res.scalars())
+     alby_map = {}
+     for p in candidates:
+         try:
+             alby_map[p.id] = await alby_is_paid_by_ref(p.client_ref)
+         except Exception:
+             alby_map[p.id] = None
+     async with SessionLocal() as phase_db:
+         async with phase_db.begin():
+             for p in candidates:
+                 data = alby_map.get(p.id)
+                 if data and data.get("id"):
+                     await phase_db.execute(
+                         update(Payment)
+                         .where(
+                             Payment.id == p.id,
+                             Payment.payment_version == 1,
+                             Payment.invoice_id.is_(None),
+                         )
+                         .values(
+                             invoice_id=data["id"],
+                             payment_request=data.get("payment_request"),
+                             expires_at=data.get("expires_at"),
+                             state='open',
+                             payment_version=2,
+                         )
+                     )
+     # Phase 2 – settle or kill every remaining transitional row.
+     # Each candidate is processed in its own short transaction so a failure
+     # of one cannot leave a partial credit committed for another.
+     candidates = []
+     async with SessionLocal() as phase_db:
+         async with phase_db.begin():
+             res = await phase_db.execute(
+                 select(Payment)
+                 .where(
+                     Payment.state.in_(['reserving', 'awaiting_payment', 'open']),
+                     Payment.tokens_credited == False,
+                     Payment.payment_version.in_([1, 2, 4]),
+                 )
+                 .with_for_update()
+             )
+             candidates = list(res.scalars())
+     alby_map = {}
+     for p in candidates:
+         try:
+             if p.invoice_id:
+                 alby_map[p.id] = await alby_is_paid(p.invoice_id)
+             else:
+                 data = await alby_is_paid_by_ref(p.client_ref)
+                 alby_map[p.id] = (
+                     data.get("state") in ("settled", "paid") or data.get("paid") is True
+                     if data else None
+                 )
+         except Exception:
+             alby_map[p.id] = None
+     for p in candidates:
+         paid_on_alby = alby_map.get(p.id)
+         if paid_on_alby is True:
+             async with SessionLocal() as credit_db:
+                 try:
+                     async with credit_db.begin():
+                         await credit_db.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+                         res = await credit_db.execute(
+                             select(Payment)
+                             .where(Payment.id == p.id)
+                             .with_for_update()
+                         )
+                         cur = res.scalar_one_or_none()
+                         if cur is None or cur.tokens_credited:
+                             continue
+                         ok = await add_tokens(
+                             cur.uid,
+                             cur.tokens,
+                             payment_id=cur.id,
+                             reason='recovery',
+                             db=credit_db,
+                             invoice_id=cur.invoice_id,
+                             payment_request=cur.payment_request,
+                             expires_at=cur.expires_at,
+                         )
+                         if not ok:
+                             raise RuntimeError("add_tokens failed – leave for next boot")
+                 except Exception:
+                     # residual stays transitional; next boot will retry
+                     pass
+         elif paid_on_alby is False:
+             async with SessionLocal() as kill_db:
+                 async with kill_db.begin():
+                     await kill_db.execute(
+                         update(Payment)
+                         .where(
+                             Payment.id == p.id,
+                             Payment.tokens_credited == False,
+                             Payment.payment_version.in_([1, 2, 4]),
+                             Payment.created < func.now() - text(
+                                 f"interval '{RESERVING_TIMEOUT_SEC} seconds'"
+                             ),
+                         )
+                         .values(state='dead', payment_version=3)
+                     )
+     # No further phases. Residual rows are left for the next boot.
+diff--- a/modules/referral_system.py
++++ b/modules/referral_system.py
+@@ -XX,XX +XX,XX @@ async def credit_referral(owner_id, new_user_id, db=None):
+     # Single OCC loop, true SERIALIZABLE, single uid lock.
+     # referral_earned_today check and increment are atomic under the same FOR UPDATE.
+     # When we own the session a *fresh* SessionLocal is created on every attempt.
+     daily_cap, reward = await _get_ref_config()
+     for attempt in range(OCC_RETRIES):
+         own_db = db is None
+         session = db
+         if own_db:
+             session = SessionLocal()
+         try:
+             if own_db:
+                 async with session.begin():
+                     await session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+                     uid_lock = await _get_uid_lock(owner_id)
+                     async with uid_lock:
+                         u_new = await session.get(User, new_user_id, with_for_update=True)
+                         if not u_new or u_new.referred_by is not None:
+                             return False
+                         res = await session.execute(
+                             select(User.balance_version, User.referral_earned_today)
+                             .where(User.uid == owner_id)
+                             .with_for_update()
+                         )
+                         row = res.first()
+                         if not row or row[1] >= daily_cap:
+                             return False
+                         expected_version = row[0]
+                         await session.execute(
+                             update(User)
+                             .where(User.uid == new_user_id)
+                             .values(referred_by=owner_id)
+                         )
+                         stmt = (
+                             update(User)
+                             .where(
+                                 User.uid == owner_id,
+                                 User.balance_version == expected_version,
+                                 User.referral_earned_today < daily_cap,
+                             )
+                             .values(
+                                 tokens=User.tokens + reward,
+                                 balance_version=User.balance_version + 1,
+                                 referral_earned_today=User.referral_earned_today + 1,
+                                 lifetime_referral_tokens=User.lifetime_referral_tokens + reward,
+                             )
+                         )
+                         res = await session.execute(stmt)
+                         if res.rowcount == 1:
+                             return True
+             else:
+                 # External transaction – never begin().
+                 uid_lock = await _get_uid_lock(owner_id)
+                 async with uid_lock:
+                     u_new = await session.get(User, new_user_id, with_for_update=True)
+                     if not u_new or u_new.referred_by is not None:
+                         return False
+                     res = await session.execute(
+                         select(User.balance_version, User.referral_earned_today)
+                         .where(User.uid == owner_id)
+                         .with_for_update()
+                     )
+                     row = res.first()
+                     if not row or row[1] >= daily_cap:
+                         return False
+                     expected_version = row[0]
+                     await session.execute(
+                         update(User)
+                         .where(User.uid == new_user_id)
+                         .values(referred_by=owner_id)
+                     )
+                     stmt = (
+                         update(User)
+                         .where(
+                             User.uid == owner_id,
+                             User.balance_version == expected_version,
+                             User.referral_earned_today < daily_cap,
+                         )
+                         .values(
+                             tokens=User.tokens + reward,
+                             balance_version=User.balance_version + 1,
+                             referral_earned_today=User.referral_earned_today + 1,
+                             lifetime_referral_tokens=User.lifetime_referral_tokens + reward,
+                         )
+                     )
+                     res = await session.execute(stmt)
+                     if res.rowcount == 1:
+                         return True
+         except DBAPIError as e:
+             if attempt < OCC_RETRIES - 1 and getattr(e.orig, 'pgcode', None) == '40001':
+                 await asyncio.sleep(random.uniform(0.03, 0.09))
+                 continue
+             raise
+         finally:
+             if own_db and session is not None:
+                 await session.close()
+     return False
+
+I WANT YOU TO CHECK IF BELOW BUG ( SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) EXISTS ONLY AFTER APPLYING ALL THE  PATCHES ABOVE SEQUENTIALLY.(FROM PATCH 1-37)
 
 1.SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS
   MODULE 05 set_state uses async with db.begin() then sets last_activity = func.now() (SQL expression object, not evaluated).
@@ -8558,9 +9329,9 @@ WARNING!!THIS IS A DRY RUN, SPECULATIVE EXECUTION, PREFLIGHT VALIDATION, WE ARE 
 
 IF THE BUG (SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) EXISTS:
 
-DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND PROVIDE A MITIGATION PATCH THAT FOLLOWS BELOW RULES 100% UNCONDITIONALY
+DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND CHECM PROVIDED MITIGATION PATCH IF IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
 
-1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12, then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19, then patch 20, then patch 21,then patch 22,then patch 23,then patch 24, then patch 25,then patch 26,then patch 27,then patch 28,then patch 29,then patch 30,then patch 31,then patch 32,then patch 33,then patch 34,then patch 35)TO THE EXISTING COMPILED MODULE.
+1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE PATCHES ABOVE SEQUENTIALLY FROM PATCH 1-36 TO THE EXISTING COMPILED MODULE.
 2.IT SHOULD CLOSE THE ( SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
 3.IT SHOULD ONLY ALTER CODE THAT  (SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
 4.NO RUNTIME CRONS/CLEANERS/PERIODIC SCHEDULER ONLY ONE BOOT JANITOR THAT CAN RECOVER THE SYSYEM IN WHATEVER STATE IT WAS BEFORE FULL BOT OUTAGE
