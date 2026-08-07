@@ -9301,48 +9301,39 @@ diff--- a/modules/referral_system.py
                  await session.close()
      return False
 
-I WANT YOU TO CHECK IF BELOW BUG ( SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) EXISTS ONLY AFTER APPLYING ALL THE  PATCHES ABOVE SEQUENTIALLY.(FROM PATCH 1-37)
+I WANT YOU TO CHECK IF BELOW BUG ( REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES) EXISTS ONLY AFTER APPLYING ALL THE  PATCHES ABOVE SEQUENTIALLY.(FROM PATCH 1-37)
 
-1.SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS
-  MODULE 05 set_state uses async with db.begin() then sets last_activity = func.now() (SQL expression object, not evaluated).
-  MODULE 11 add_tokens / deduct_tokens: own_session path does async with db.begin() inside a for-retry loop while the session object is created outside; close happens in finally but begin() may leave the session in a dirty state on exception.
-  MODULE 13 activate_package: nested begin() + with_for_update + OCC retry inside a single session that may already be in a transaction.
-  MODULE 17B create_invoice: two separate sessions — one inserts payment_version=1, second attaches invoice; race window between them.
-  MODULE 23 alby_webhook: multiple sequential begin() blocks on the same SessionLocal instance; after first begin the second begin raises InvalidRequestError or silently fails depending on driver.
-  MODULE 26 recover_and_finalize_boot: opens many independent SessionLocal() contexts while the caller also holds a session; nested begin() + with_for_update across sessions produces lock contention and lost updates.
-  Many places do db.get() then later db.execute(update) without ensuring the object is still attached or the transaction is open.
-  MODULE 11 _add_tokens_inner: for-loop over OCC_RETRIES, on success break, else after loop return False; however the payment finalization update is outside the OCC loop and can fail independently, leaving tokens credited but payment not marked.
-  MODULE 11 deduct_tokens: isolation_level="SERIALIZABLE" set via execution_options on a select(1) which does not actually change the transaction isolation for subsequent statements in all SQLAlchemy/asyncpg versions.
-  MODULE 13 activate_package: double OCC loop (outer attempt + inner retry) both using the same with_for_update row; version check can be stale between the two levels.
-  MODULE 16 credit_referral: similar double OCC + referral_earned_today check; can overshoot DAILY_REF_CAP under concurrent credits.
-  balance_version is incremented only on successful rowcount==1, but many call sites ignore the False return and proceed as if tokens moved.
-  Payment states: reserving / awaiting_payment / open / paid / dead. Multiple modules transition with different version numbers.
-  MODULE 17B inserts state='awaiting_payment', payment_version=1.
-  MODULE 23 webhook forces reserving→open or awaiting→open with version 1→2, then calls add_tokens which forces version 3 and paid=True.
-  MODULE 26 recovery has three separate phases that re-read and re-write the same rows with overlapping version predicates; a payment can be marked dead in phase 2 while phase 3 still tries to credit it.
-  UniqueConstraint uq_one_unpaid_invoice and Index uq_uid_payment_v1 use postgresql_where clauses that do not cover all transitional states, allowing two unpaid rows under race.
-  CheckConstraint ck_state_mutation_authority and ck_invoice_single_writer are violated by recovery paths that write invoice_id while version is still 1.
-
+1.REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES
+  MODULE 11 maintains _uid_locks dict + Redis side-effect keys; locks are process-local only.
+  MODULE 24A uid_lock decorator uses Redis NX lock with TTL; MODULE 24B lock_user_for_buy uses DB column invoice_lock_until.
+  Three independent locking mechanisms (in-memory asyncio.Lock, Redis key, DB timestamp) never coordinate; concurrent buy + credit + package activation can interleave.
+  Caches (_GATE_CACHE, _PREMIUM_CACHE, _REF_LINK_CACHE, _GIF_CACHE, _PRICE_CACHE, EXPIRING_SOON_SET) are process-local; multi-worker or restart loses them or serves stale data.
+  MODULE 14 start_cache_clear spawns a task that clears caches but is never scheduled from MODULE 22 entry.
+  MODULE 16 ref_links / _REF_LINK_CACHE recovered from Settings but never cleaned of expired entries except in a background loop that may not be started.
+  MODULE 12 _GATE_CACHE and _CHATMEM_CACHE are global dicts with TTL; concurrent gate_check calls can race on write.
+  Cache stores status string; after kick the cache still returns “member” until TTL expires, allowing expired users to keep interacting.
+  setgate1 clears only part of the cache; other processes keep the old id.
+  check_gate returns False on any exception, treating network blips as “left channel”.
 
 
 WARNING!!THIS IS A DRY RUN, SPECULATIVE EXECUTION, PREFLIGHT VALIDATION, WE ARE TESTING THE PATCH BELOW  IF IT WILL APPLY CLEANLY TO CODEBASE WITHOUT MODIFYING ACTIVE PROJECT FILES. MY COMPILED CODE HAS NOT BEEN PATCHED YET, THE PATCH IS A SUGESTION OF WHAT I SHOULD DO
 
-IF THE BUG (SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) EXISTS:
+IF THE BUG (REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES) EXISTS:
 
-DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND CHECM PROVIDED MITIGATION PATCH IF IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
+DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND  CHECK PROVIDED  MITIGATION PATCH IF IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
 
-1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE PATCHES ABOVE SEQUENTIALLY FROM PATCH 1-36 TO THE EXISTING COMPILED MODULE.
-2.IT SHOULD CLOSE THE ( SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
-3.IT SHOULD ONLY ALTER CODE THAT  (SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
+1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE PATCHES ABOVE SEQUENTIALLY FROM PATCH 1-37 TO THE EXISTING COMPILED MODULE.
+2.IT SHOULD CLOSE THE ( REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
+3.IT SHOULD ONLY ALTER CODE THAT  (REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
 4.NO RUNTIME CRONS/CLEANERS/PERIODIC SCHEDULER ONLY ONE BOOT JANITOR THAT CAN RECOVER THE SYSYEM IN WHATEVER STATE IT WAS BEFORE FULL BOT OUTAGE
 5.LET THE SYTEM HANDLE ITSELF IF THERE IS A TIMEOUT, ERROR, CRASH 
 6.IF A PROCESS CANT HANDLE ITSELF DURING UPTIME THEN IT SHOULD BE HANDLED BY BOOT RWECOVERY DURING A FULL BOT RESTART
-7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) bug (if it exists) NO OTHER CASES
+7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES) bug (if it exists) NO OTHER CASES
+
 
 WARNING!! DO NOT RESEND THE PATCH IF ALL 7 RULES ARE FOLLOWED AND THERE IS LITERALLY ZERO CODE CHANGE FROM WHAT I HAVE BELOW
                    
 IF THE PATCH BELOW DOES NOT FOLLOW ALL 7 RULES  TELL ME EXACTLY WHAT RULE HAS BEEN BROKEN, STATE THE EXACT CODE FROM THE PATCH BELOW AND WHAT NEEDS TO CHANGE FROM THE PATCH BELOW , THEN UPDATE IT AND RESEND THE PATCH,DO NOT USE PLACEHOLDERS LIKE "KEEP PREVIOUS PATCH SUGGESTION"AND DO NOT PUT REFERENCE TO OLD CODE FROM THE OLD PATCH THAT I DISCARDED ENTIRELY.AND AFTER GENERATING NEW PATCH STATE EXACT CODE LINES  THAT CHANGED FROM PREVIOUS PATCH BELOW
 
 WRITE OUT THE  UPDATED PATCH FULLY EVEN  WITH THE CODE  THAT DID NOT CHANGE FROM PREVIOUS PATCH BELOW
-
 
