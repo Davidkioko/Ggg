@@ -2354,7 +2354,7 @@ _alby_semaphore = asyncio.Semaphore(1)async def batch_delete_messages(client, ch
     print("[MODULE 26 - USER_AND_PAYMENT_LIFECYCLE] Loaded v1.2.0")
 
 
-COMPLIANT PATCHES LIST IN ORDER OF IMPLEMENTATION
+APPLY THE BELOW PATCHES SEQUENTIALLY IN ORDER AS LISTED BELOW ONE BY ONE ,AFTER COMPILING THE MODULES ABOVE.
 
 PATCH 1.(apply to patch 13 only
 
@@ -8079,21 +8079,8 @@ PATCH 35
      # Failed kicks are left for the single boot janitor; no runtime
      # recovery path is introduced.
 
-I WANT YOU TO CHECK IF BELOW BUG ( Telegram Event Timing & Approval/Kick Desynchronization)  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is sequentially patch 1 then patch 2,then patch 3, then patch 4, then patch 5, then patch 6, then patch 7,then PATCH 8,then PATCH 9,then patch 10,then patch 11,then patch 12,then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19,then patch 20,then patch 21,then patch 22,then patch 23,then patch 24,then patch 25, then patch 26,then patch 27, then patch 28,then patch 29,then patch 30,then patch 31,then patch 32,then patch 33,then patch 34,then patch 25) ON THE COMPILED MODULES
 
-Telegram Event Timing & Approval/Kick Desynchronization
-1.Kick logic only runs in specific paths (on_chat_member for non-referral, or scheduler). Leaks are possible during bot downtime or scheduler lag.
 
-WARNING!!THIS IS A DRY RUN, SPECULATIVE EXECUTION, PREFLIGHT VALIDATION, WE ARE TESTING THE PATCH BELOW  IF IT WILL APPLY CLEANLY TO CODEBASE WITHOUT MODIFYING ACTIVE PROJECT FILES. MY COMPILED CODE HAS NOT BEEN PATCHED YET, THE PATCH IS A SUGESTION OF WHAT I SHOULD DO
+NOW AFTER IMPLEMENTATION OF THE PATCHES IN ORDER. PERFORM A RIGOROUS FULL IN DEPTH ANALYSIS AND REVIEW OF A PREFLIGHT VALIDATION,SPECULATIVE EXECUTION A DRY RUN AND STATE WHAT ROOT CAUSE GROUP  FROM BELOW  HAS BEEN MITIGATED 100% WITH ABSOLUTE NO REMAINING EDGE CASES FROM IT
 
-IF THE BUG (Telegram Event Timing & Approval/Kick Desynchronization) EXISTS:
-
-DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND  PROVIDE A MITIGATION PATCH THAT FOLLOWS BELOW RULES 100% UNCONDITIONALY
-1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12, then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19, then patch 20, then patch 21,then patch 22,then patch 23,then patch 24, then patch 25,then patch 26,then patch 27,then patch 28,then patch 29,then patch 30,then patch 31,then patch 32,then patch 33,then patch 34,then patch 35)TO THE EXISTING COMPILED MODULE.
-2.IT SHOULD CLOSE THE ( Telegram Event Timing & Approval/Kick Desynchronization) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
-3.IT SHOULD ONLY ALTER CODE THAT  (Telegram Event Timing & Approval/Kick Desynchronization) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
-4.NO RUNTIME CRONS/CLEANERS/PERIODIC SCHEDULER ONLY ONE BOOT JANITOR THAT CAN RECOVER THE SYSYEM IN WHATEVER STATE IT WAS BEFORE FULL BOT OUTAGE
-5.LET THE SYTEM HANDLE ITSELF IF THERE IS A TIMEOUT, ERROR, CRASH 
-6.IF A PROCESS CANT HANDLE ITSELF DURING UPTIME THEN IT SHOULD BE HANDLED BY BOOT RWECOVERY DURING A FULL BOT RESTART
-7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( Telegram Event Timing & Approval/Kick Desynchronization) bug (if it exists) NO OTHER CASES
 
