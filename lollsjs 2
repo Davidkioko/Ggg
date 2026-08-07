@@ -7537,21 +7537,563 @@ PATCH 31
 
 
 
-I WANT YOU TO CHECK IF BELOW BUG ( Overstay / Expiry Race:)  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is sequentially patch 1 then patch 2,then patch 3, then patch 4, then patch 5, then patch 6, then patch 7,then PATCH 8,then PATCH 9,then patch 10,then patch 11,then patch 12,then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19,then patch 20,then patch 21,then patch 22,then patch 23,then patch 24,then patch 25, then patch 26,then patch 27, then patch 28,then patch 29,then patch 30,then patch 31) ON THE COMPILED MODULES
 
-Overstay / Expiry Race:
-1.EXPIRING_SOON_SET is in-memory only → on restart, repopulate_expiring_set runs, but there's a gap where users with expired packages aren't kicked immediately.
+PATCH 32
+
+--- a/modules/invites.py
++++ b/modules/invites.py
+@@ -XX,XX +XX,XX @@ async def handle_join_request(client, join_req):
+     if config.SYSTEM_LOCKED:
+         return
+     chat_id = join_req.chat.id
+     user_id = join_req.from_user.id
+     referral_channel_id = await get_referral_channel(client)
+     if not referral_channel_id:
+         async with tg_semaphore:
+             await client.decline_chat_join_request(chat_id, user_id)
+         return
+     if chat_id == referral_channel_id:
+         async with tg_semaphore:
+             await client.approve_chat_join_request(chat_id, user_id)
+         return
+-    async with SessionLocal() as db:
+-        u = await db.get(User, user_id)
+-        now = datetime.now(timezone.utc)
+-        if u and u.package_end > now:
+-            async with tg_semaphore:
+-                await client.approve_chat_join_request(chat_id, user_id)
+-        else:
+-            async with tg_semaphore:
+-                await client.decline_chat_join_request(chat_id, user_id)
++    # Authoritative package_end decision under SERIALIZABLE + FOR UPDATE.
++    # Lock held only for the DB read; Telegram approve/decline runs after
++    # the transaction commits. Final membership authority remains
++    # on_chat_member (which re-validates under its own lock). Residual
++    # membership after any failure is recovered solely by the boot janitor.
++    approve = False
++    async with SessionLocal() as db:
++        async with db.begin():
++            await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
++            res = await db.execute(
++                select(User)
++                .where(User.uid == user_id)
++                .with_for_update()
++            )
++            u = res.scalar_one_or_none()
++            now = datetime.now(timezone.utc)
++            if u is not None and u.package_end is not None and u.package_end > now:
++                approve = True
++    if approve:
++        async with tg_semaphore:
++            await client.approve_chat_join_request(chat_id, user_id)
++    else:
++        async with tg_semaphore:
++            await client.decline_chat_join_request(chat_id, user_id)
+
+@@ -XX,XX +XX,XX @@ async def on_join_complete(client, update):
+     if config.SYSTEM_LOCKED:
+         return
+     new_member = update.new_chat_member
+     chat_id = update.chat.id
+     if not new_member or not new_member.user:
+         return
+     user_id = new_member.user.id
+     msg_id_to_delete = None
+     should_kick = False
+     referral_channel_id = await get_referral_channel(client)
+     link = update.invite_link.invite_link if update.invite_link else None
+-    async with SessionLocal() as db:
+-        async with db.begin():
+-            owner_id = await get_ref_owner_from_link(link, db) if link else None
+-            u = await db.get(User, user_id, with_for_update=True)
+-            if not u:
+-                pass
+-            else:
+-                if u.invite_pending_chat_id == chat_id and u.invite_pending_msg_id:
+-                    msg_id_to_delete = u.invite_pending_msg_id
+-                    await db.execute(update(User).where(User.uid == user_id).values(invite_pending_chat_id=None, invite_pending_msg_id=None))
+-                if referral_channel_id and chat_id == referral_channel_id:
+-                    if owner_id and owner_id != user_id and u.referred_by is None:
+-                        from config import REFERRAL_REWARD, DAILY_REF_CAP
+-                        owner = await db.get(User, owner_id, with_for_update=True)
+-                        if owner and owner.referral_earned_today < DAILY_REF_CAP:
+-                            await db.execute(update(User).where(User.uid == user_id).values(referred_by=owner_id))
+-                            for _ in range(3):
+-                                res_ver = await db.execute(select(User.balance_version).where(User.uid == owner_id).with_for_update())
+-                                row = res_ver.first()
+-                                if not row:
+-                                    break
+-                                expected_version = row[0]
+-                                stmt = (update(User).where(User.uid == owner_id, User.referral_earned_today < DAILY_REF_CAP, User.balance_version == expected_version).values(tokens=User.tokens + REFERRAL_REWARD, balance_version=User.balance_version + 1, referral_earned_today=User.referral_earned_today + 1, lifetime_referral_tokens=User.lifetime_referral_tokens + REFERRAL_REWARD))
+-                                res = await db.execute(stmt)
+-                                if res.rowcount == 1:
+-                                    break
+-                now = datetime.now(timezone.utc)
+-                if not referral_channel_id or chat_id != referral_channel_id:
+-                    if not u.package_end or u.package_end <= now:
+-                        should_kick = True
+-
+-    if msg_id_to_delete:
+-        try:
+-            async with tg_semaphore:
+-                await client.delete_messages(chat_id=user_id, message_ids=msg_id_to_delete)
+-        except:
+-            pass
+-    from modules.kick import kick_with_fallback
+-    if should_kick:
+-        await kick_with_fallback(client, chat_id, user_id)
++    # Snapshot + decision under SERIALIZABLE + FOR UPDATE.
++    # Network (delete pending msg / kick) is performed *outside* the
++    # transaction. Membership authority stays here; any residual
++    # membership after a failed kick is recovered exclusively by the
++    # boot janitor (no runtime cleaner).
++    owner_id = None
++    async with SessionLocal() as db:
++        async with db.begin():
++            await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
++            if link:
++                owner_id = await get_ref_owner_from_link(link, db)
++            res = await db.execute(
++                select(User)
++                .where(User.uid == user_id)
++                .with_for_update()
++            )
++            u = res.scalar_one_or_none()
++            if u is not None:
++                if u.invite_pending_chat_id == chat_id and u.invite_pending_msg_id:
++                    msg_id_to_delete = u.invite_pending_msg_id
++                    await db.execute(
++                        update(User)
++                        .where(User.uid == user_id)
++                        .values(invite_pending_chat_id=None, invite_pending_msg_id=None)
++                    )
++                if referral_channel_id and chat_id == referral_channel_id:
++                    if owner_id and owner_id != user_id and u.referred_by is None:
++                        from config import REFERRAL_REWARD, DAILY_REF_CAP
++                        owner = await db.get(User, owner_id, with_for_update=True)
++                        if owner and owner.referral_earned_today < DAILY_REF_CAP:
++                            await db.execute(
++                                update(User)
++                                .where(User.uid == user_id)
++                                .values(referred_by=owner_id)
++                            )
++                            for _ in range(3):
++                                res_ver = await db.execute(
++                                    select(User.balance_version)
++                                    .where(User.uid == owner_id)
++                                    .with_for_update()
++                                )
++                                row = res_ver.first()
++                                if not row:
++                                    break
++                                expected_version = row[0]
++                                stmt = (
++                                    update(User)
++                                    .where(
++                                        User.uid == owner_id,
++                                        User.referral_earned_today < DAILY_REF_CAP,
++                                        User.balance_version == expected_version,
++                                    )
++                                    .values(
++                                        tokens=User.tokens + REFERRAL_REWARD,
++                                        balance_version=User.balance_version + 1,
++                                        referral_earned_today=User.referral_earned_today + 1,
++                                        lifetime_referral_tokens=User.lifetime_referral_tokens + REFERRAL_REWARD,
++                                    )
++                                )
++                                res = await db.execute(stmt)
++                                if res.rowcount == 1:
++                                    break
++                now = datetime.now(timezone.utc)
++                if not referral_channel_id or chat_id != referral_channel_id:
++                    if u.package_end is None or u.package_end <= now:
++                        should_kick = True
++
++    if msg_id_to_delete:
++        try:
++            async with tg_semaphore:
++                await client.delete_messages(chat_id=user_id, message_ids=msg_id_to_delete)
++        except Exception:
++            pass
++
++    if not should_kick:
++        return
++
++    from modules.kick import kick_with_fallback
++    await kick_with_fallback(client, chat_id, user_id)
++    # Failed kicks are left for the single boot janitor; no runtime
++    # recovery path is introduced.
+
+
+PATCH 33
+
+--- a/modules/invites.py
++++ b/modules/invites.py
+@@ -XX,XX +XX,XX @@ async def handle_join_request(client, join_req):
+     if config.SYSTEM_LOCKED:
+         return
+     chat_id = join_req.chat.id
+     user_id = join_req.from_user.id
+     referral_channel_id = await get_referral_channel(client)
+     if not referral_channel_id:
+         async with tg_semaphore:
+             await client.decline_chat_join_request(chat_id, user_id)
+         return
+     if chat_id == referral_channel_id:
+         async with tg_semaphore:
+             await client.approve_chat_join_request(chat_id, user_id)
+         return
+-    # Authoritative package_end decision under SERIALIZABLE + FOR UPDATE.
+-    # Lock held only for the DB read; Telegram approve/decline runs after
+-    # the transaction commits. Final membership authority remains
+-    # on_chat_member (which re-validates under its own lock). Residual
+-    # membership after any failure is recovered solely by the boot janitor.
+-    approve = False
+-    async with SessionLocal() as db:
+-        async with db.begin():
+-            await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
+-            res = await db.execute(
+-                select(User)
+-                .where(User.uid == user_id)
+-                .with_for_update()
+-            )
+-            u = res.scalar_one_or_none()
+-            now = datetime.now(timezone.utc)
+-            if u is not None and u.package_end is not None and u.package_end > now:
+-                approve = True
+-    if approve:
+-        async with tg_semaphore:
+-            await client.approve_chat_join_request(chat_id, user_id)
+-    else:
+-        async with tg_semaphore:
+-            await client.decline_chat_join_request(chat_id, user_id)
++    # Authoritative decision under SERIALIZABLE + FOR UPDATE.
++    # The lock is held only for the read; the Telegram call is issued
++    # immediately after commit.  Immediately after a successful approve
++    # we re-validate under a fresh short transaction.  If the package
++    # is no longer valid we issue a kick.  Any residual membership
++    # (Telegram race, network failure, crash between approve and kick)
++    # is recovered exclusively by the single boot janitor – no runtime
++    # cleaner is introduced.
++    approve = False
++    async with SessionLocal() as db:
++        async with db.begin():
++            await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
++            res = await db.execute(
++                select(User)
++                .where(User.uid == user_id)
++                .with_for_update()
++            )
++            u = res.scalar_one_or_none()
++            now = datetime.now(timezone.utc)
++            if u is not None and u.package_end is not None and u.package_end > now:
++                approve = True
++    if not approve:
++        async with tg_semaphore:
++            await client.decline_chat_join_request(chat_id, user_id)
++        return
++
++    async with tg_semaphore:
++        await client.approve_chat_join_request(chat_id, user_id)
++
++    # Post-approve re-validation (short critical section, no network
++    # while the lock is held).  Closes the TOCTOU window that existed
++    # between the original snapshot and the Telegram approve call.
++    still_valid = False
++    async with SessionLocal() as db:
++        async with db.begin():
++            await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
++            res = await db.execute(
++                select(User)
++                .where(User.uid == user_id)
++                .with_for_update()
++            )
++            u = res.scalar_one_or_none()
++            now = datetime.now(timezone.utc)
++            if u is not None and u.package_end is not None and u.package_end > now:
++                still_valid = True
++    if not still_valid:
++        from modules.kick import kick_with_fallback
++        await kick_with_fallback(client, chat_id, user_id)
++        # Failed kick is left for the boot janitor; no further action.
+
+
+PATCH 34
+
+--- a/modules/invites.py
++++ b/modules/invites.py
+@@ -XX,XX +XX,XX @@ async def handle_join_request(client, join_req):
+     if config.SYSTEM_LOCKED:
+         return
+     chat_id = join_req.chat.id
+     user_id = join_req.from_user.id
+     referral_channel_id = await get_referral_channel(client)
+     if not referral_channel_id:
+         async with tg_semaphore:
+             await client.decline_chat_join_request(chat_id, user_id)
+         return
+     if chat_id == referral_channel_id:
+         async with tg_semaphore:
+             await client.approve_chat_join_request(chat_id, user_id)
+         return
+-    # Authoritative package_end decision under SERIALIZABLE + FOR UPDATE.
+-    # Lock held only for the DB read; Telegram approve/decline runs after
+-    # the transaction commits. Final membership authority remains
+-    # on_chat_member (which re-validates under its own lock). Residual
+-    # membership after any failure is recovered solely by the boot janitor.
+-    approve = False
+-    async with SessionLocal() as db:
+-        async with db.begin():
+-            await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
+-            res = await db.execute(
+-                select(User)
+-                .where(User.uid == user_id)
+-                .with_for_update()
+-            )
+-            u = res.scalar_one_or_none()
+-            now = datetime.now(timezone.utc)
+-            if u is not None and u.package_end is not None and u.package_end > now:
+-                approve = True
+-    if approve:
+-        async with tg_semaphore:
+-            await client.approve_chat_join_request(chat_id, user_id)
+-    else:
+-        async with tg_semaphore:
+-            await client.decline_chat_join_request(chat_id, user_id)
++    # Authoritative decision under SERIALIZABLE + FOR UPDATE.
++    # The lock is held only for the read; the Telegram call is issued
++    # immediately after commit.  Immediately after a successful approve
++    # we re-validate under a fresh short transaction.  If the package
++    # is no longer valid we issue a kick.  Any residual membership
++    # (Telegram race, network failure, crash between approve and kick)
++    # is recovered exclusively by the single boot janitor – no runtime
++    # cleaner is introduced.
++    approve = False
++    async with SessionLocal() as db:
++        async with db.begin():
++            await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
++            res = await db.execute(
++                select(User)
++                .where(User.uid == user_id)
++                .with_for_update()
++            )
++            u = res.scalar_one_or_none()
++            now = datetime.now(timezone.utc)
++            if u is not None and u.package_end is not None and u.package_end > now:
++                approve = True
++    if not approve:
++        async with tg_semaphore:
++            await client.decline_chat_join_request(chat_id, user_id)
++        return
++
++    async with tg_semaphore:
++        await client.approve_chat_join_request(chat_id, user_id)
++
++    # Post-approve re-validation (short critical section, no network
++    # while the lock is held).  Closes the TOCTOU window that existed
++    # between the original snapshot and the Telegram approve call.
++    still_valid = False
++    async with SessionLocal() as db:
++        async with db.begin():
++            await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
++            res = await db.execute(
++                select(User)
++                .where(User.uid == user_id)
++                .with_for_update()
++            )
++            u = res.scalar_one_or_none()
++            now = datetime.now(timezone.utc)
++            if u is not None and u.package_end is not None and u.package_end > now:
++                still_valid = True
++    if not still_valid:
++        from modules.kick import kick_with_fallback
++        await kick_with_fallback(client, chat_id, user_id)
++        # Failed kick is left for the boot janitor; no further action.
+
+PATCH 35
+
+--- a/modules/invites.py
++++ b/modules/invites.py
+@@ -XX,XX +XX,XX @@ async def handle_join_request(client, join_req):
+     if config.SYSTEM_LOCKED:
+         return
+     chat_id = join_req.chat.id
+     user_id = join_req.from_user.id
+     referral_channel_id = await get_referral_channel(client)
+     if not referral_channel_id:
+         async with tg_semaphore:
+             await client.decline_chat_join_request(chat_id, user_id)
+         return
+     if chat_id == referral_channel_id:
+         async with tg_semaphore:
+             await client.approve_chat_join_request(chat_id, user_id)
+         return
+ 
+     # Authoritative decision under SERIALIZABLE + FOR UPDATE.
+     # Lock held only for the read; Telegram call issued after commit.
+     # Immediately after a successful approve we re-validate under a
+     # fresh short transaction. If the package is no longer valid we
+     # issue a kick. Any residual membership (Telegram race, network
+     # failure, crash between approve and kick, delayed or lost
+     # ChatMemberUpdated) is recovered exclusively by the single boot
+     # janitor – no runtime cleaner is introduced.
+     approve = False
+     async with SessionLocal() as db:
+         async with db.begin():
+             await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
+             res = await db.execute(
+                 select(User)
+                 .where(User.uid == user_id)
+                 .with_for_update()
+             )
+             u = res.scalar_one_or_none()
+             now = datetime.now(timezone.utc)
+             if u is not None and u.package_end is not None and u.package_end > now:
+                 approve = True
+     if not approve:
+         async with tg_semaphore:
+             await client.decline_chat_join_request(chat_id, user_id)
+         return
+ 
+     async with tg_semaphore:
+         await client.approve_chat_join_request(chat_id, user_id)
+ 
+     # Post-approve re-validation (short critical section, no network
+     # while the lock is held). Closes the TOCTOU between the original
+     # snapshot and the Telegram approve call for the join-request path.
+     still_valid = False
+     async with SessionLocal() as db:
+         async with db.begin():
+             await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
+             res = await db.execute(
+                 select(User)
+                 .where(User.uid == user_id)
+                 .with_for_update()
+             )
+             u = res.scalar_one_or_none()
+             now = datetime.now(timezone.utc)
+             if u is not None and u.package_end is not None and u.package_end > now:
+                 still_valid = True
+     if not still_valid:
+         from modules.kick import kick_with_fallback
+         await kick_with_fallback(client, chat_id, user_id)
+         # Failed kick is left for the boot janitor; no further action.
+ 
+@@ -XX,XX +XX,XX @@ async def on_join_complete(client, update):
+     if config.SYSTEM_LOCKED:
+         return
+     new_member = update.new_chat_member
+     chat_id = update.chat.id
+     if not new_member or not new_member.user:
+         return
+     user_id = new_member.user.id
+     msg_id_to_delete = None
+     should_kick = False
+     referral_channel_id = await get_referral_channel(client)
+     link = update.invite_link.invite_link if update.invite_link else None
+ 
+     # Snapshot + decision under SERIALIZABLE + FOR UPDATE.
+     # Network (delete pending msg / kick) performed outside the
+     # transaction. Membership authority stays here. Any residual
+     # membership after a failed kick, lost event, or delivery delay
+     # is recovered exclusively by the single boot janitor (no runtime
+     # cleaner).
+     owner_id = None
+     async with SessionLocal() as db:
+         async with db.begin():
+             await db.execute(select(1).execution_options(isolation_level="SERIALIZABLE"))
+             if link:
+                 owner_id = await get_ref_owner_from_link(link, db)
+             res = await db.execute(
+                 select(User)
+                 .where(User.uid == user_id)
+                 .with_for_update()
+             )
+             u = res.scalar_one_or_none()
+             if u is not None:
+                 if u.invite_pending_chat_id == chat_id and u.invite_pending_msg_id:
+                     msg_id_to_delete = u.invite_pending_msg_id
+                     await db.execute(
+                         update(User)
+                         .where(User.uid == user_id)
+                         .values(invite_pending_chat_id=None, invite_pending_msg_id=None)
+                     )
+                 if referral_channel_id and chat_id == referral_channel_id:
+                     if owner_id and owner_id != user_id and u.referred_by is None:
+                         from config import REFERRAL_REWARD, DAILY_REF_CAP
+                         owner = await db.get(User, owner_id, with_for_update=True)
+                         if owner and owner.referral_earned_today < DAILY_REF_CAP:
+                             await db.execute(
+                                 update(User)
+                                 .where(User.uid == user_id)
+                                 .values(referred_by=owner_id)
+                             )
+                             for _ in range(3):
+                                 res_ver = await db.execute(
+                                     select(User.balance_version)
+                                     .where(User.uid == owner_id)
+                                     .with_for_update()
+                                 )
+                                 row = res_ver.first()
+                                 if not row:
+                                     break
+                                 expected_version = row[0]
+                                 stmt = (
+                                     update(User)
+                                     .where(
+                                         User.uid == owner_id,
+                                         User.referral_earned_today < DAILY_REF_CAP,
+                                         User.balance_version == expected_version,
+                                     )
+                                     .values(
+                                         tokens=User.tokens + REFERRAL_REWARD,
+                                         balance_version=User.balance_version + 1,
+                                         referral_earned_today=User.referral_earned_today + 1,
+                                         lifetime_referral_tokens=User.lifetime_referral_tokens + REFERRAL_REWARD,
+                                     )
+                                 )
+                                 res = await db.execute(stmt)
+                                 if res.rowcount == 1:
+                                     break
+                 now = datetime.now(timezone.utc)
+                 # Same package_end predicate used by the join-request path.
+                 # Evaluated under the row lock that owns the decision.
+                 # Does not eliminate Telegram delivery latency; residual
+                 # membership is recovered solely by the boot janitor.
+                 if not referral_channel_id or chat_id != referral_channel_id:
+                     if u.package_end is None or u.package_end <= now:
+                         should_kick = True
+ 
+     if msg_id_to_delete:
+         try:
+             async with tg_semaphore:
+                 await client.delete_messages(chat_id=user_id, message_ids=msg_id_to_delete)
+         except Exception:
+             pass
+ 
+     if not should_kick:
+         return
+ 
+     from modules.kick import kick_with_fallback
+     await kick_with_fallback(client, chat_id, user_id)
+     # Failed kicks are left for the single boot janitor; no runtime
+     # recovery path is introduced.
+
+I WANT YOU TO CHECK IF BELOW BUG ( Telegram Event Timing & Approval/Kick Desynchronization)  AFTER COMPLIANT PATCHES ABOVE HAVE BEEN IMPLEMENTED (implementation order is sequentially patch 1 then patch 2,then patch 3, then patch 4, then patch 5, then patch 6, then patch 7,then PATCH 8,then PATCH 9,then patch 10,then patch 11,then patch 12,then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19,then patch 20,then patch 21,then patch 22,then patch 23,then patch 24,then patch 25, then patch 26,then patch 27, then patch 28,then patch 29,then patch 30,then patch 31,then patch 32,then patch 33,then patch 34,then patch 25) ON THE COMPILED MODULES
+
+Telegram Event Timing & Approval/Kick Desynchronization
+1.Kick logic only runs in specific paths (on_chat_member for non-referral, or scheduler). Leaks are possible during bot downtime or scheduler lag.
 
 WARNING!!THIS IS A DRY RUN, SPECULATIVE EXECUTION, PREFLIGHT VALIDATION, WE ARE TESTING THE PATCH BELOW  IF IT WILL APPLY CLEANLY TO CODEBASE WITHOUT MODIFYING ACTIVE PROJECT FILES. MY COMPILED CODE HAS NOT BEEN PATCHED YET, THE PATCH IS A SUGESTION OF WHAT I SHOULD DO
 
-IF THE BUG (Overstay / Expiry Race) EXISTS:
+IF THE BUG (Telegram Event Timing & Approval/Kick Desynchronization) EXISTS:
 
-DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND PROVIDE A MITIGATION PATCH THAT FOLLOWS BELOW RULES 100% UNCONDITIONALY
-1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12, then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19, then patch 20, then patch 21,then patch 22,then patch 23,then patch 24, then patch 25,then patch 26,then patch 27,then patch 28,then patch 29,then patch 30,then patch 31)TO THE EXISTING COMPILED MODULE.
-2.IT SHOULD CLOSE THE ( Overstay / Expiry Race) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
-3.IT SHOULD ONLY ALTER CODE THAT  (Overstay / Expiry Race) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
+DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND  PROVIDE A MITIGATION PATCH THAT FOLLOWS BELOW RULES 100% UNCONDITIONALY
+1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12, then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19, then patch 20, then patch 21,then patch 22,then patch 23,then patch 24, then patch 25,then patch 26,then patch 27,then patch 28,then patch 29,then patch 30,then patch 31,then patch 32,then patch 33,then patch 34,then patch 35)TO THE EXISTING COMPILED MODULE.
+2.IT SHOULD CLOSE THE ( Telegram Event Timing & Approval/Kick Desynchronization) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
+3.IT SHOULD ONLY ALTER CODE THAT  (Telegram Event Timing & Approval/Kick Desynchronization) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
 4.NO RUNTIME CRONS/CLEANERS/PERIODIC SCHEDULER ONLY ONE BOOT JANITOR THAT CAN RECOVER THE SYSYEM IN WHATEVER STATE IT WAS BEFORE FULL BOT OUTAGE
 5.LET THE SYTEM HANDLE ITSELF IF THERE IS A TIMEOUT, ERROR, CRASH 
 6.IF A PROCESS CANT HANDLE ITSELF DURING UPTIME THEN IT SHOULD BE HANDLED BY BOOT RWECOVERY DURING A FULL BOT RESTART
-7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( Overstay / Expiry Race) bug (if it exists) NO OTHER CASES
+7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( Telegram Event Timing & Approval/Kick Desynchronization) bug (if it exists) NO OTHER CASES
 
