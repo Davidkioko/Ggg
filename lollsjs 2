@@ -8079,45 +8079,499 @@ PATCH 35
      # Failed kicks are left for the single boot janitor; no runtime
      # recovery path is introduced.
 
+PATCH 36
 
+--- /dev/null
++++ b/config.py
+@@ -0,0 +1,42 @@
++# Thin compatibility shim. All real definitions live in modules.config_loader.
++# Existing "from config import X" / "import config" statements continue to work.
++# The single runtime-mutable flag (SYSTEM_LOCKED) is kept in lock-step by a
++# custom ModuleType so every attribute write is visible in both namespaces.
++# No other names are mutable at runtime.
++import sys
++import types
++import modules.config_loader as _real
++
++class _ConfigModule(types.ModuleType):
++    def __getattr__(self, name):
++        return getattr(_real, name)
++
++    def __setattr__(self, name, value):
++        if name == "SYSTEM_LOCKED":
++            # Keep both namespaces identical for the single mutable flag.
++            object.__setattr__(self, name, value)
++            setattr(_real, name, value)
++        else:
++            # All other names are read-only from the shim's point of view;
++            # forward to the real module so accidental writes are visible.
++            setattr(_real, name, value)
++
++# Install the custom module object so attribute assignment is intercepted.
++_mod = _ConfigModule("config")
++_mod.__dict__.update({k: v for k, v in _real.__dict__.items()
++                      if not k.startswith("_")})
++# Seed the name so "from config import SYSTEM_LOCKED" works at import time.
++_mod.SYSTEM_LOCKED = _real.SYSTEM_LOCKED
++sys.modules["config"] = _mod
++
++# Re-export everything for "from config import *" consumers.
++from modules.config_loader import *  # noqa: F401,F403
++SYSTEM_LOCKED = _real.SYSTEM_LOCKED
++
++--- /dev/null
++++ b/core/__init__.py
+@@ -0,0 +1,2 @@
++# Core package – only re-exports the real modules under their historical names.
++# No new logic.
++
++--- /dev/null
++++ b/core/logger.py
+@@ -0,0 +1,2 @@
++# Historical name used by MODULE 09 / 18 / etc.
++from modules.logger_utils import *  # noqa: F401,F403
++
++--- /dev/null
++++ b/core/bot.py
+@@ -0,0 +1,2 @@
++# Historical name used throughout the codebase.
++from modules.bot_init import *  # noqa: F401,F403
++
++--- /dev/null
++++ b/core/state_manager.py
+@@ -0,0 +1,2 @@
++# Historical name used by webhook_server, callbacks_*, lifecycle, entry, etc.
++from modules.state_manager import *  # noqa: F401,F403
++
++--- /dev/null
++++ b/core/scheduler.py
+@@ -0,0 +1,2 @@
++# Historical name used by entry / lifecycle.
++from modules.scheduler import *  # noqa: F401,F403
++
++--- /dev/null
++++ b/core/handlers.py
+@@ -0,0 +1,3 @@
++# MODULE 22 imported "core.handlers" which never existed.
++# Provide an empty module so the import succeeds; no handlers are registered here.
++# Real handlers live in the callback / gatekeeper modules.
++pass
++
++--- /dev/null
++++ b/utils/__init__.py
+@@ -0,0 +1 @@
++# Compatibility package.
++
++--- /dev/null
++++ b/utils/constants.py
+@@ -0,0 +1,2 @@
++# Historical name used by MODULE 23 / 24A.
++from modules.constants import *  # noqa: F401,F403
++
++--- a/modules/tg_api.py
++++ b/modules/tg_api.py
+@@ -1,40 +1,30 @@
+ import asyncio
+ from core.logger import safe_call
+ from core.bot import app, tg_semaphore
+ async def _safe_send(client, chat_id, text, **kwargs):
+     # Acquire lives only inside safe_call; do not nest.
+     return await safe_call(client.send_message, chat_id, text, **kwargs)
+ async def batch_delete_messages(client, chat_id, msg_ids):
+     if not msg_ids:
+         return
+     # Hard ceiling – protects against unbounded menu_msg_ids / _PENDING_DELETE
+     # lists. Excess IDs are dropped (best-effort delete of the first MAX).
+     # No background cleaner; the bound is enforced on every call.
+     MAX_BATCH_DELETE = 2_000
+     if len(msg_ids) > MAX_BATCH_DELETE:
+         msg_ids = msg_ids[:MAX_BATCH_DELETE]
+     chunks = [msg_ids[i:i+100] for i in range(0, len(msg_ids), 100)]
+     for chunk in chunks:
+         await safe_call(client.delete_messages, chat_id, chunk)
+         await asyncio.sleep(0.1) # spread load
+-async def kick_with_fallback(client, chat_id, user_id):
+-    res = await safe_call(client.ban_chat_member, chat_id, user_id)
+-    if res is None:
+-        return False
+-    member = await safe_call(client.get_chat_member, chat_id, user_id)
+-    if member and member.status in ["left", "kicked"]:
+-        return True
+-    return False
+-
+ async def unban_user(client, chat_id, user_id):
+     return await safe_call(client.unban_chat_member, chat_id, user_id) is not None
+ async def approve_join(client, chat_id, user_id):
+     return await safe_call(client.approve_chat_join_request, chat_id, user_id) is not None
+ async def send_message(client, chat_id, text, **kwargs):
+     """Public helper: use this instead of client.send_message directly"""
+     return await _safe_send(client, chat_id, text, **kwargs)
+ if __name__ != "__main__":
+     print("[MODULE 09 - TG_API_WRAPPER] Loaded v1.0.6")
++
++--- a/modules/kick.py
++++ b/modules/kick.py
+@@ -1,25 +1,22 @@
+ from core.logger import safe_call
+ from config import ADMIN_IDS
+ async def kick_with_fallback(client, chat_id, uid):
+     if uid in ADMIN_IDS:
+         return False
+     try:
+         # Use the rate-limited path; safe_call now owns the acquire.
+         member = await safe_call(client.get_chat_member, chat_id, uid)
+         if member and member.status in ["creator", "administrator"]:
+             return False
+     except Exception:
+         pass
+     res = await safe_call(client.ban_chat_member, chat_id, uid)
+     if res is None:
+         return False
+     member = await safe_call(client.get_chat_member, chat_id, uid)
+     if member and member.status in ["left", "kicked"]:
+         return True
+     return False
+ if __name__ != "__main__":
+     print("[MODULE 18 - KICK] Loaded v1.0.6")
++
++--- a/modules/invites.py
++++ b/modules/invites.py
+@@ -1,20 +1,22 @@
+ from datetime import datetime, timezone
+ from pyrogram import filters
+ from core.bot import app, tg_semaphore
+ from db.db import SessionLocal
+ from db.models import User, Setting
+ from sqlalchemy.ext.asyncio import AsyncSession
+ from modules.premium import get_invite_link, set_invite_link
+ from modules.kick import kick_with_fallback
+ from modules.tg_api import send_message
+ from config import REFERRAL_CHANNEL
+ import config
+ import time
+ from sqlalchemy import update, select, delete
++from modules.referral_system import get_ref_owner_from_link, _parse_channel_id
+ _REFERRAL_CACHE = {"value": None, "ts": 0}
+ CACHE_TTL_REFERRAL = 1800
+ _referral_cache_lock = asyncio.Lock()
+-async def get_ref_owner_from_link(link: str, db: AsyncSession):
+-    s = await db.get(Setting, f"ref_invite_{link}")
+-    if not s:
+-        return None
+-    try:
+-        owner_str, exp_str = s.value.split("|")
+-        expires = datetime.fromisoformat(exp_str)
+-        if expires < datetime.now(timezone.utc):
+-            await db.execute(delete(Setting).where(Setting.key == s.key))
+-            return None
+-        return int(owner_str)
+-    except Exception:
+-        return None
+-async def _parse_channel_id(client, raw):
+-    if not raw:
+-        return None
+-    if isinstance(raw, int):
+-        return raw
+-    if str(raw).startswith("-100"):
+-        return int(raw)
+-    try:
+-        async with tg_semaphore:
+-            chat = await client.get_chat(raw)
+-        numeric_id = chat.id
+-        async with SessionLocal() as db:
+-            async with db.begin():
+-                await db.merge(Setting(key="referral_channel", value=str(numeric_id)))
+-        return numeric_id
+-    except:
+-        return None
++
++--- a/modules/callbacks_ui.py
++++ b/modules/callbacks_ui.py
+@@ -1,40 +1,41 @@
+ import asyncio
+ import time
+ import json
+ import uuid
+ import redis.asyncio as redis
+ from pyrogram import filters
+ from pyrogram.types import CallbackQuery
+ from core.bot import app, tg_semaphore
+ from core.state_manager import set_state
+ from modules.gatekeeper import check_gate
+ from db.db import SessionLocal
+ from db.models import User
+ from modules.menus import main_menu, packages_menu, premium_menu, invite_menu, referral_menu, buy_menu, stats_menu
+ from utils.constants import get_gif
+ from config import ADMIN_IDS
+ import config
+ from modules.config_loader import SEND_SLEEP, REDIS_HOST, BOOT_LOCK_KEY, UID_ACTION_LOCK_TTL
+ from sqlalchemy.ext.asyncio import AsyncSession
++from modules.tg_api import batch_delete_messages
+ _MENU_COALESCE = {}
+ _PENDING_DELETE = {}
+ _redis_cb = None
+ _menu_coalesce_lock = asyncio.Lock()
+ _pending_delete_lock = asyncio.Lock()
+ MENU_COALESCE_MAX = 50_000
+ PENDING_DELETE_MAX = 20_000
+ CB_RATE_WINDOW_SEC = 10
+ CB_RATE_MAX = 8
+-async def batch_delete_messages(client, chat_id, msg_ids):
+-    if not msg_ids:
+-        return
+-    chunks = [msg_ids[i:i+100] for i in range(0, len(msg_ids), 100)]
+-    for chunk in chunks:
+-        async with tg_semaphore:
+-            try:
+-                await client.delete_messages(chat_id, chunk)
+-            except:
+-                pass
+-        await asyncio.sleep(SEND_SLEEP)
++
++--- a/modules/user_and_payment_lifecycle.py
++++ b/modules/user_and_payment_lifecycle.py
+@@ -1,40 +1,41 @@
+ from datetime import datetime, timedelta, timezone
+ from db.db import get_http, SessionLocal
+ from db.models import User, Payment, WebhookJob
+ from core.bot import app, tg_semaphore
+ from core.scheduler import scheduler
+ from core.state_manager import set_state
+ from modules.kick import kick_with_fallback
+ from modules.menus import packages_menu
+ from modules.tokens import add_tokens
+ from utils.constants import get_gif
+ from config import OVERSTAY_MAX_SEC, INACTIVITY_DELETE_SEC, ADMIN_IDS, ALBY_TOKEN
+ from modules.config_loader import RESERVING_TIMEOUT_SEC
+ from modules.alby_client import alby_is_paid, alby_is_paid_by_ref
+ import json
+ import asyncio
+ import time
+ import uuid
+ import logging
+ from sqlalchemy import select, update, delete, not_, exists, func, or_, text
+ from sqlalchemy.ext.asyncio import AsyncSession
++from modules.tg_api import batch_delete_messages
+ logger = logging.getLogger(__name__)
+ EXPIRING_SOON_SET = set()
+ last_kick_check = {}
+ _MENU_BUFFER = {}
+ _PENDING_DELETE = {}
+ _alby_semaphore = asyncio.Semaphore(1)
+-async def batch_delete_messages(client, chat_id, msg_ids):
+-    if not msg_ids: return
+-    MAX_BATCH_DELETE = 2_000
+-    if len(msg_ids) > MAX_BATCH_DELETE:
+-        msg_ids = msg_ids[:MAX_BATCH_DELETE]
+-    chunks = [msg_ids[i:i+100] for i in range(0, len(msg_ids), 100)]
+-    for chunk in chunks:
+-        async with tg_semaphore:
+-            try:
+-                await client.delete_messages(chat_id, chunk)
+-            except: pass
+-        await asyncio.sleep(0.1)
++
++--- a/modules/callbacks_payment.py
++++ b/modules/callbacks_payment.py
+@@ -1,40 +1,41 @@
+ import asyncio
+ import time
+ import random
+ from datetime import datetime, timezone, timedelta
+ from pyrogram import filters
+ from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+ from core.bot import app
+ from core.state_manager import set_state
+ from db.db import SessionLocal
+ from db.models import Payment, WebhookJob, User
+ from modules.menus import packages_menu, buy_menu, invite_menu, confirm_buy_menu
+ from modules.templates import PAYMENT_WARNING
+ from modules.callbacks_ui import gate_guard, vanish_and_send, _safe_send, _MENU_COALESCE, uid_lock
+ from sqlalchemy import update, select, func, and_, text, delete
+ from sqlalchemy.dialects.postgresql import insert as pg_insert
+ from sqlalchemy.exc import IntegrityError
+ from sqlalchemy.ext.asyncio import AsyncSession
+ from modules.config_loader import USER_LOCK_TIMEOUT_SEC, REDIS_HOST
+ import config
+ import redis.asyncio as redis
++from modules.logger_utils import retry_with_jitter
+ _PAYMENT_DEBOUNCE = {}
+ _redis_pay = None
+-async def retry_with_jitter(fn, *args, max_attempts=3, **kwargs):
+-    for i in range(max_attempts):
+-        try:
+-            return await fn(*args, **kwargs)
+-        except Exception:
+-            if i == max_attempts-1:
+-                raise
+-            await asyncio.sleep((2**i) + random.uniform(0.1, 0.5))
+-    return None
++
++--- a/modules/entry.py
++++ b/modules/entry.py
+@@ -1,40 +1,50 @@
+ import asyncio
+ import os
+ from datetime import datetime, timezone, timedelta
+ from core.bot import app
+ from core.scheduler import scheduler
+ from modules.webhook_server import start_webhook_server
+ import modules.callbacks_ui as callbacks_ui
+ import modules.callbacks_payment as callbacks_payment
+ from modules.referral_system import _do_recovery as load_ref_cache, ref_links, _REF_LINK_CACHE
+ from modules.user_and_payment_lifecycle import (
+     check_expiry, check_overstay, flush_pending_deletes,
+     recover_and_finalize_boot, add_expiring_user, repopulate_expiring_set
+ )
+ from db.db import Base, engine as async_engine, SessionLocal, close_http, get_http
+ from db.models import User, Setting, Payment
+ import core.handlers
+ from modules.constants import load_gif_cache
+ from modules.premium import load_premium_cache
+ from modules.invites import load_referral_cache
+ import aiohttp
+ import redis.asyncio as redis
+ import config
+ from config import ADMIN_IDS
+ from sqlalchemy import update, select, delete, text, func
+ from modules.config_loader import IS_PAID, CLOUDFLARE_PING_SEC, WEBHOOK_TIMEOUT, REDIS_HOST, BOOT_LOCK_KEY, RECOVERY_MAX_RUNTIME_SEC, RESERVING_TIMEOUT_SEC
++from modules.health import ping_self
++import modules.config_loader as _cfg
+-async def ping_self():
+-    try:
+-        s = await get_http()
+-        await s.get("http://localhost:8080/health", timeout=aiohttp.ClientTimeout(total=WEBHOOK_TIMEOUT))
+-    except Exception as e:
+-        import logging
+-        logging.getLogger(__name__).debug("ping_self ignored: %s", e)
+-        pass
++
++# SYSTEM_LOCKED is the only runtime-mutable flag that participates in the
++# import-path chaos. The shim's ModuleType.__setattr__ already mirrors every
++# write; the dual assignment below is retained solely for explicit clarity and
++# remains harmless.
+ async def main():
+-    config.SYSTEM_LOCKED = True
++    config.SYSTEM_LOCKED = True
++    _cfg.SYSTEM_LOCKED = True
+     await init_db()
+     …
+-    config.SYSTEM_LOCKED = False
++    config.SYSTEM_LOCKED = False
++    _cfg.SYSTEM_LOCKED = False
+     …
++
++--- a/modules/webhook_server.py
++++ b/modules/webhook_server.py
+@@ -1,40 +1,40 @@
+ import json
+ import hmac
+ import hashlib
+ import os
+ from datetime import datetime, timezone
+ from aiohttp import web
+ from db.db import SessionLocal, get_http, close_http
+ from db.models import Payment, User, Setting, Base
+ from modules.menus import main_menu, packages_menu
+ from modules.templates import PAYMENT_WARNING
+-from utils.constants import get_gif
++from modules.constants import get_gif
+ from core.bot import app, tg_semaphore
+ from core.state_manager import set_state
+ from sqlalchemy import update, select, func, delete, insert, exists, text, or_
+ import asyncio
+ import logging
+ import time
+ from modules.config_loader import IS_PAID, WEBHOOK_TIMEOUT, WEBHOOK_NOTIFY_PARALLEL, TOKENS_PER_USD
+-from config import WEBHOOK_SECRET
++from modules.config_loader import ALBY_WEBHOOK_SECRET as WEBHOOK_SECRET
+ import config
+ log = logging.getLogger(__name__)
+ WEBHOOK_SECRET_ENV = os.getenv("ALBY_WEBHOOK_SECRET")
+ IDEMPOTENCY_TTL = 86400
+ _NOTIFY_SEMAPHORE = asyncio.Semaphore(WEBHOOK_NOTIFY_PARALLEL)
+ _redis = None
++
++--- a/modules/admin_commands.py
++++ b/modules/admin_commands.py
+@@ -1,20 +1,21 @@
+ import asyncio
+ from datetime import datetime, timezone
+ from pyrogram import filters
+ from pyrogram.types import Message
+ from core.bot import app, tg_semaphore
+ from db.db import SessionLocal
+ from db.models import Setting, User, Payment
+ from modules.tokens import add_tokens
+ from modules.health import get_health
+ from modules.constants import DEFAULT_POST
+ from modules.constants import load_gif_cache
+ from modules.premium import load_premium_cache
+ from modules.invites import load_referral_cache
+ from config import ADMIN_IDS
+ from sqlalchemy import select, func
++from modules.referral_system import _parse_channel_id
+ async def _safe_send(client, uid, msg):
+     try:
+         async with tg_semaphore:
+             await client.send_message(uid, msg)
+         await asyncio.sleep(0.05)
+     except:
+         pass
+-async def _parse_channel_id(client, raw):
+-    if not raw:
+-        return None
+-    if str(raw).startswith("-100"):
+-        return int(raw)
+-    try:
+-        async with tg_semaphore:
+-            chat = await client.get_chat(raw)
+-        return chat.id
+-    except:
+-        return None
 
-I WANT YOU TO CHECK IF BELOW BUG ( IMPORT PATH / MODULE RESOLUTION CHAOS + DUPLICATE DEFINITIONS) EXISTS ONLY AFTER APPLYING THE  PATCHES ABOVE SEQUENTIALLY.
+I WANT YOU TO CHECK IF BELOW BUG ( SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) EXISTS ONLY AFTER APPLYING THE  PATCHES ABOVE SEQUENTIALLY.
 
-1.IMPORT PATH / MODULE RESOLUTION CHAOS + DUPLICATE DEFINITIONS
-  config vs modules.config_loader vs core.* vs db.db vs db.models — every module invents its own import style.
-  MODULE 02 imports from config and later modules import from modules.config_loader for the same symbols.
-  MODULE 09 imports from core.logger / core.bot while MODULE 04 is logger_utils and MODULE 07 is bot_init.
-  MODULE 11 imports REDIS_HOST from modules.config_loader while other modules pull it from config.
-  MODULE 15/16 import kick / premium / tokens with inconsistent package prefixes.
-  MODULE 22 imports core.handlers that is never defined in the provided modules.
-  MODULE 23 imports from utils.constants and config.WEBHOOK_SECRET while the secret lives in modules.config_loader / os.getenv.
-  Circular and missing modules will raise ImportError / ModuleNotFoundError at startup.
-  kick_with_fallback defined in MODULE 09 and again in MODULE 18 with slightly different admin checks.
-  get_ref_owner_from_link defined in MODULE 15 and again in MODULE 16.
-  batch_delete_messages defined in MODULE 09, MODULE 24A, MODULE 26.
-  retry_with_jitter defined in MODULE 04 and again in MODULE 24B.
-  ping_self defined in MODULE 10 and again in MODULE 22.
-  _parse_channel_id appears in MODULE 15, 16, 19 with different cache behaviour.
-  Import order determines which definition wins; silent behavioural divergence.
+1.SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS
+  MODULE 05 set_state uses async with db.begin() then sets last_activity = func.now() (SQL expression object, not evaluated).
+  MODULE 11 add_tokens / deduct_tokens: own_session path does async with db.begin() inside a for-retry loop while the session object is created outside; close happens in finally but begin() may leave the session in a dirty state on exception.
+  MODULE 13 activate_package: nested begin() + with_for_update + OCC retry inside a single session that may already be in a transaction.
+  MODULE 17B create_invoice: two separate sessions — one inserts payment_version=1, second attaches invoice; race window between them.
+  MODULE 23 alby_webhook: multiple sequential begin() blocks on the same SessionLocal instance; after first begin the second begin raises InvalidRequestError or silently fails depending on driver.
+  MODULE 26 recover_and_finalize_boot: opens many independent SessionLocal() contexts while the caller also holds a session; nested begin() + with_for_update across sessions produces lock contention and lost updates.
+  Many places do db.get() then later db.execute(update) without ensuring the object is still attached or the transaction is open.
+  MODULE 11 _add_tokens_inner: for-loop over OCC_RETRIES, on success break, else after loop return False; however the payment finalization update is outside the OCC loop and can fail independently, leaving tokens credited but payment not marked.
+  MODULE 11 deduct_tokens: isolation_level="SERIALIZABLE" set via execution_options on a select(1) which does not actually change the transaction isolation for subsequent statements in all SQLAlchemy/asyncpg versions.
+  MODULE 13 activate_package: double OCC loop (outer attempt + inner retry) both using the same with_for_update row; version check can be stale between the two levels.
+  MODULE 16 credit_referral: similar double OCC + referral_earned_today check; can overshoot DAILY_REF_CAP under concurrent credits.
+  balance_version is incremented only on successful rowcount==1, but many call sites ignore the False return and proceed as if tokens moved.
+  Payment states: reserving / awaiting_payment / open / paid / dead. Multiple modules transition with different version numbers.
+  MODULE 17B inserts state='awaiting_payment', payment_version=1.
+  MODULE 23 webhook forces reserving→open or awaiting→open with version 1→2, then calls add_tokens which forces version 3 and paid=True.
+  MODULE 26 recovery has three separate phases that re-read and re-write the same rows with overlapping version predicates; a payment can be marked dead in phase 2 while phase 3 still tries to credit it.
+  UniqueConstraint uq_one_unpaid_invoice and Index uq_uid_payment_v1 use postgresql_where clauses that do not cover all transitional states, allowing two unpaid rows under race.
+  CheckConstraint ck_state_mutation_authority and ck_invoice_single_writer are violated by recovery paths that write invoice_id while version is still 1.
+
 
 
 WARNING!!THIS IS A DRY RUN, SPECULATIVE EXECUTION, PREFLIGHT VALIDATION, WE ARE TESTING THE PATCH BELOW  IF IT WILL APPLY CLEANLY TO CODEBASE WITHOUT MODIFYING ACTIVE PROJECT FILES. MY COMPILED CODE HAS NOT BEEN PATCHED YET, THE PATCH IS A SUGESTION OF WHAT I SHOULD DO
 
-IF THE BUG (IMPORT PATH / MODULE RESOLUTION CHAOS + DUPLICATE DEFINITIONS) EXISTS:
+IF THE BUG (SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) EXISTS:
 
-DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND CHECK PROVIDED MITIGATION PATCH IF IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
+DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND PROVIDE A MITIGATION PATCH THAT FOLLOWS BELOW RULES 100% UNCONDITIONALY
 
 1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE COMPLIANT PATCHES ABOVE (IN THIS IMPLEMENTATION ORDER PATCH 1,then PATCH 2, THEN PATCH 3, THEN PATCH 4, THEN PATCH 5,PATCH 6,PATCH 7,then patch 8,then patch 9,then patch 10,then patch 11,then patch 12, then patch 13,then patch 14,then patch 15,then patch 16,then patch 17,then patch 18,then patch 19, then patch 20, then patch 21,then patch 22,then patch 23,then patch 24, then patch 25,then patch 26,then patch 27,then patch 28,then patch 29,then patch 30,then patch 31,then patch 32,then patch 33,then patch 34,then patch 35)TO THE EXISTING COMPILED MODULE.
-2.IT SHOULD CLOSE THE ( IMPORT PATH / MODULE RESOLUTION CHAOS + DUPLICATE DEFINITIONS) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
-3.IT SHOULD ONLY ALTER CODE THAT  (IMPORT PATH / MODULE RESOLUTION CHAOS + DUPLICATE DEFINITIONS) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
+2.IT SHOULD CLOSE THE ( SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
+3.IT SHOULD ONLY ALTER CODE THAT  (SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
 4.NO RUNTIME CRONS/CLEANERS/PERIODIC SCHEDULER ONLY ONE BOOT JANITOR THAT CAN RECOVER THE SYSYEM IN WHATEVER STATE IT WAS BEFORE FULL BOT OUTAGE
 5.LET THE SYTEM HANDLE ITSELF IF THERE IS A TIMEOUT, ERROR, CRASH 
 6.IF A PROCESS CANT HANDLE ITSELF DURING UPTIME THEN IT SHOULD BE HANDLED BY BOOT RWECOVERY DURING A FULL BOT RESTART
-7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( IMPORT PATH / MODULE RESOLUTION CHAOS + DUPLICATE DEFINITIONS) bug (if it exists) NO OTHER CASES
-
+7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( SESSION / TRANSACTION LIFECYCLE + OCC + PAYMENT STATE MACHINE VIOLATIONS) bug (if it exists) NO OTHER CASES
 
 WARNING!! DO NOT RESEND THE PATCH IF ALL 7 RULES ARE FOLLOWED AND THERE IS LITERALLY ZERO CODE CHANGE FROM WHAT I HAVE BELOW
                    
 IF THE PATCH BELOW DOES NOT FOLLOW ALL 7 RULES  TELL ME EXACTLY WHAT RULE HAS BEEN BROKEN, STATE THE EXACT CODE FROM THE PATCH BELOW AND WHAT NEEDS TO CHANGE FROM THE PATCH BELOW , THEN UPDATE IT AND RESEND THE PATCH,DO NOT USE PLACEHOLDERS LIKE "KEEP PREVIOUS PATCH SUGGESTION"AND DO NOT PUT REFERENCE TO OLD CODE FROM THE OLD PATCH THAT I DISCARDED ENTIRELY.AND AFTER GENERATING NEW PATCH STATE EXACT CODE LINES  THAT CHANGED FROM PREVIOUS PATCH BELOW
 
 WRITE OUT THE  UPDATED PATCH FULLY EVEN  WITH THE CODE  THAT DID NOT CHANGE FROM PREVIOUS PATCH BELOW
+
+
