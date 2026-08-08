@@ -9301,53 +9301,545 @@ diff--- a/modules/referral_system.py
                  await session.close()
      return False
 
-I WANT YOU TO CHECK IF BELOW BUG ( REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES) EXISTS ONLY AFTER APPLYING ALL THE  PATCHES ABOVE SEQUENTIALLY.(FROM PATCH 1-37)
 
-1.REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES
-  MODULE 11 maintains _uid_locks dict + Redis side-effect keys; locks are process-local only.
-  MODULE 24A uid_lock decorator uses Redis NX lock with TTL; MODULE 24B lock_user_for_buy uses DB column invoice_lock_until.
-  Three independent locking mechanisms (in-memory asyncio.Lock, Redis key, DB timestamp) never coordinate; concurrent buy + credit + package activation can interleave.
-  Caches (_GATE_CACHE, _PREMIUM_CACHE, _REF_LINK_CACHE, _GIF_CACHE, _PRICE_CACHE, EXPIRING_SOON_SET) are process-local; multi-worker or restart loses them or serves stale data.
-  MODULE 14 start_cache_clear spawns a task that clears caches but is never scheduled from MODULE 22 entry.
-  MODULE 16 ref_links / _REF_LINK_CACHE recovered from Settings but never cleaned of expired entries except in a background loop that may not be started.
-  MODULE 12 _GATE_CACHE and _CHATMEM_CACHE are global dicts with TTL; concurrent gate_check calls can race on write.
-  Cache stores status string; after kick the cache still returns “member” until TTL expires, allowing expired users to keep interacting.
-  setgate1 clears only part of the cache; other processes keep the old id.
-  check_gate returns False on any exception, treating network blips as “left channel”.
+PATCH 38
+
+--- a/modules/tokens.py
++++ b/modules/tokens.py
+@@ -XX,XX +XX,XX @@ _uid_locks: dict[int, asyncio.Lock] = {}
+ _global_lock = asyncio.Lock()
+ _redis_tok = None
+ UID_LOCKS_MAX = 40_000
++from modules.config_loader import REDIS_HOST, UID_ACTION_LOCK_TTL
++import uuid
+ async def _get_redis_tok():
+     global _redis_tok
+     if _redis_tok is None:
+         _redis_tok = redis.Redis(host=REDIS_HOST, decode_responses=True)
+     return _redis_tok
+ async def _get_uid_lock(uid: int) -> asyncio.Lock:
+     """
+     Process-local asyncio.Lock for in-process serialisation only.
+     Cross-process mutual exclusion is performed exclusively by the
+     shared Redis action lock (acquire_action_lock). The in-memory
+     lock therefore only prevents concurrent coroutines inside this
+     process from interleaving the same OCC critical section.
+     """
+     async with _global_lock:
+         if uid not in _uid_locks:
+             _uid_locks[uid] = asyncio.Lock()
+         if len(_uid_locks) > UID_LOCKS_MAX:
+             try:
+                 _uid_locks.pop(next(iter(_uid_locks)))
+             except (StopIteration, RuntimeError):
+                 pass
+         return _uid_locks[uid]
++
++# ---------------------------------------------------------------------------
++# Single shared Redis action lock used by every public mutation path
++# that the residual lock-divergence bug concerns (UI + webhook credit).
++# Key: vip:action:{uid}
++# TTL = UID_ACTION_LOCK_TTL so a crashed holder cannot block forever.
++# Boot janitor never clears these keys; they self-expire.
++# Acquisition is fail-closed: Redis error raises; contention returns None.
++# ---------------------------------------------------------------------------
++async def acquire_action_lock(uid: int, token: str | None = None) -> str | None:
++    """
++    Acquire the cross-process action lock for `uid`.
++    Returns the ownership token on success, None on contention.
++    Raises on Redis failure so the caller is forced to abort.
++    """
++    r = await _get_redis_tok()
++    lock_key = f"vip:action:{uid}"
++    ownership = token or str(uuid.uuid4())
++    try:
++        if await r.set(lock_key, ownership, nx=True, ex=UID_ACTION_LOCK_TTL):
++            return ownership
++        return None
++    except Exception as e:
++        raise RuntimeError("action lock redis failure") from e
++
++async def release_action_lock(uid: int, token: str) -> None:
++    """Release only if we still own the lock (token match)."""
++    r = await _get_redis_tok()
++    lock_key = f"vip:action:{uid}"
++    try:
++        current = await r.get(lock_key)
++        if current == token:
++            await r.delete(lock_key)
++    except Exception:
++        # Best-effort; the TTL is the ultimate safety net.
++        pass
++
+ --- a/modules/callbacks_ui.py
++++ b/modules/callbacks_ui.py
+@@ -XX,XX +XX,XX @@ def uid_lock(func):
+     async def wrapper(client, query: CallbackQuery):
+         uid = query.from_user.id
+         r = await _get_redis_cb()
+         if await r.get(BOOT_LOCK_KEY):
+             await query.answer("Bot is starting, please wait", show_alert=True)
+             return
+         # ---- rate limit (fixed window, self-expiring keys) ----
+         rate_key = f"vip:cb_rate:{uid}"
+         try:
+             count = await r.incr(rate_key)
+             if count == 1:
+                 await r.expire(rate_key, CB_RATE_WINDOW_SEC)
+             if count > CB_RATE_MAX:
+                 await query.answer("Too many requests. Slow down.", show_alert=True)
+                 return
+         except Exception:
+             await query.answer("Service busy, try again shortly", show_alert=True)
+             return
+- lock_key = f"vip:uid_lock:{uid}"
+- token = str(uuid.uuid4())
+- if not await r.set(lock_key, token, nx=True, ex=UID_ACTION_LOCK_TTL):
+- await query.answer("Processing your last click...", show_alert=False)
+- return
++ # Single cross-process action lock (covers buy, package activation,
++ # referral, etc. – every UI mutation the residual bug concerns).
++ # Fail-closed: contention returns None; Redis error raises.
++ from modules.tokens import acquire_action_lock, release_action_lock
++ try:
++     token = await acquire_action_lock(uid)
++ except RuntimeError:
++     await query.answer("Service busy, try again shortly", show_alert=True)
++     return
++ if token is None:
++     await query.answer("Processing your last click...", show_alert=False)
++     return
+         try:
+             return await func(client, query)
+         finally:
+- current = await r.get(lock_key)
+- if current == token:
+- await r.delete(lock_key)
++             await release_action_lock(uid, token)
+     return wrapper
+ --- a/modules/callbacks_payment.py
++++ b/modules/callbacks_payment.py
+@@ -XX,XX +XX,XX @@ async def is_user_locked_for_buy(uid, db: AsyncSession) -> bool:
+     res = await db.execute(select(User.invoice_lock_until).where(User.uid == uid).with_for_update())
+     until = res.scalar_one_or_none()
+     return until is not None and until > datetime.now(timezone.utc)
+ # (lock_user_for_buy / unlock_user_for_buy left completely unchanged –
+ # they remain the original implementations; runtime mutual exclusion
+ # is now performed exclusively by the Redis action lock held by @uid_lock.
+ # The boot janitor continues to clear expired invoice_lock_until rows.)
+ @app.on_callback_query(filters.regex("buy_confirm_yes"))
+ @uid_lock
+ @gate_guard
+ async def cb_buy_confirm_yes(_, query: CallbackQuery):
+     if config.SYSTEM_LOCKED:
+         await query.answer("Bot is starting, please wait", show_alert=True)
+         return
+     uid = query.from_user.id
+     # NOTE: do NOT acquire_action_lock here – @uid_lock already holds it.
+     r = await _get_redis_pay()
+     idemp_key = f"vip:invoice:{uid}"
+- async with SessionLocal() as db_lock:
+- async with db_lock.begin():
+- await lock_user_for_buy(uid, db_lock)
+     try:
+         result = await retry_with_jitter(create_invoice, uid)
+         pr, inv_id, pay_id, amount_usd, tokens = result
+         async with SessionLocal() as db:
+             payment_row = await db.get(Payment, pay_id)
+             client_ref = payment_row.client_ref if payment_row else None
+         if client_ref:
+             alby = await alby_is_paid_by_ref(client_ref)
+             if alby and (alby.get("state") in ["settled", "paid"] or alby.get("paid") is True):
+                 async with SessionLocal() as db:
+                     async with db.begin():
+                         ok = await add_tokens(uid, tokens, payment_id=pay_id, reason='recovery', db=db)
+                         if ok:
+                             await set_state(uid, "main", db=db)
+                 if ok:
+                     await query.answer("Payment already settled, tokens credited", show_alert=True)
+                     await _safe_send(app, uid, f"Payment confirmed, {tokens} tokens added to your balance.", photo=False)
+                     return
+         async with SessionLocal() as db:
+             async with db.begin():
+                 await set_state(uid, "awaiting_payment", db=db)
+         try:
+             await r.set(idemp_key, client_ref, ex=3600)
+         except Exception:
+             pass
+         await query.answer()
+         qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={pr}"
+         caption = f"Pay this invoice. It will auto-credit when Alby confirms.\n\n{pr}\n\n{PAYMENT_WARNING}"
+         asyncio.create_task(vanish_and_send(app, query, "main", caption, buy_menu()))
+         await _safe_send(app, uid, qr_url, caption="Scan to pay with Lightning", photo=True)
+- finally:
+- async with SessionLocal() as db_unlock:
+- async with db_unlock.begin():
+- await unlock_user_for_buy(uid, db_unlock)
++ finally:
++     # Redis action lock released by @uid_lock; DB column left for boot janitor.
++     pass
+ --- a/modules/packages.py
++++ b/modules/packages.py
+@@ -XX,XX +XX,XX @@ async def activate_package(uid, key, active_channel, db: AsyncSession = None):
++ # Called exclusively from UI handlers that already hold the shared
++ # Redis action lock via @uid_lock. No additional acquire here
++ # (would deadlock / always fail NX). Process-local _uid_lock +
++ # SERIALIZABLE remain for the OCC critical section.
+     p = PACKAGES[key]
+     cost = p["cost"]
+     for attempt in range(OCC_RETRIES):
+         own_db = db is None
+         session = db
+         if own_db:
+             session = SessionLocal()
+         try:
+             if own_db:
+                 async with session.begin():
+                     await session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+                     res = await session.execute(
+                         select(func.count())
+                         .select_from(Payment)
+                         .where(
+                             Payment.uid == uid,
+                             Payment.state.in_(['awaiting_payment', 'open', 'reserving']),
+                             Payment.paid == False,
+                         )
+                     )
+                     if (res.scalar() or 0) > 0:
+                         return False
+-                    if await is_user_locked_for_buy(uid, session):
+-                        return False
+                     uid_lock = await _get_uid_lock(uid)
+                     async with uid_lock:
+                         res = await session.execute(
+                             select(User.balance_version, User.tokens, User.active_channel)
+                             .where(User.uid == uid)
+                             .with_for_update()
+                         )
+                         row = res.first()
+                         if not row or row[1] < cost or row[2] is not None:
+                             return False
+                         expected_version = row[0]
+                         now = datetime.now(timezone.utc)
+                         stmt = (
+                             update(User)
+                             .where(
+                                 User.uid == uid,
+                                 User.balance_version == expected_version,
+                                 User.tokens >= cost,
+                                 User.active_channel.is_(None),
+                             )
+                             .values(
+                                 tokens=User.tokens - cost,
+                                 balance_version=User.balance_version + 1,
+                                 active_package=key,
+                                 active_channel=active_channel,
+                                 package_end=now + timedelta(seconds=p["internal"]),
+                             )
+                         )
+                         res = await session.execute(stmt)
+                         if res.rowcount == 1:
+                             await add_expiring_user(uid, session)
+                             return True
+             else:
+                 # External transaction already open – never begin().
+                 res = await session.execute(
+                     select(func.count())
+                     .select_from(Payment)
+                     .where(
+                         Payment.uid == uid,
+                         Payment.state.in_(['awaiting_payment', 'open', 'reserving']),
+                         Payment.paid == False,
+                     )
+                 )
+                 if (res.scalar() or 0) > 0:
+                     return False
+-                if await is_user_locked_for_buy(uid, session):
+-                    return False
+                 uid_lock = await _get_uid_lock(uid)
+                 async with uid_lock:
+                     res = await session.execute(
+                         select(User.balance_version, User.tokens, User.active_channel)
+                         .where(User.uid == uid)
+                         .with_for_update()
+                     )
+                     row = res.first()
+                     if not row or row[1] < cost or row[2] is not None:
+                         return False
+                     expected_version = row[0]
+                     now = datetime.now(timezone.utc)
+                     stmt = (
+                         update(User)
+                         .where(
+                             User.uid == uid,
+                             User.balance_version == expected_version,
+                             User.tokens >= cost,
+                             User.active_channel.is_(None),
+                         )
+                         .values(
+                             tokens=User.tokens - cost,
+                             balance_version=User.balance_version + 1,
+                             active_package=key,
+                             active_channel=active_channel,
+                             package_end=now + timedelta(seconds=p["internal"]),
+                         )
+                     )
+                     res = await session.execute(stmt)
+                     if res.rowcount == 1:
+                         await add_expiring_user(uid, session)
+                         return True
+         except DBAPIError as e:
+             if attempt < OCC_RETRIES - 1 and getattr(e.orig, 'pgcode', None) == '40001':
+                 await asyncio.sleep(random.uniform(0.02, 0.08))
+                 continue
+             raise
+         finally:
+             if own_db and session is not None:
+                 await session.close()
+     return False
+ --- a/modules/gatekeeper.py
++++ b/modules/gatekeeper.py
+@@ -XX,XX +XX,XX @@ _GATE_CACHE = {"value": None, "id": None, "ts": 0}
+ _CHATMEM_CACHE = {}
+ CACHE_TTL_GATE = 1800
+ _gate_cache_lock = asyncio.Lock()
+ _chatmem_cache_lock = asyncio.Lock()
+ CHATMEM_CACHE_MAX = 30_000
++GATE_EPOCH_KEY = "vip:gate_epoch"
+ def _chatmem_set(key, status, now):
+     """Bounded store used solely for negative (left) results.
+     Positive membership is never cached – always re-validated against Telegram.
+     """
+     if status in ("member", "administrator", "creator"):
+         _CHATMEM_CACHE.pop(key, None)
+         return
+     _CHATMEM_CACHE[key] = (status, now)
+     if len(_CHATMEM_CACHE) > CHATMEM_CACHE_MAX:
+         try:
+             _CHATMEM_CACHE.pop(next(iter(_CHATMEM_CACHE)))
+         except (StopIteration, RuntimeError):
+             pass
++async def invalidate_gate_cache():
++    """Called by setgate1. Publishes a shared Redis epoch so every
++    process forces a reload on its next _get_cached_gate. No runtime
++    cleaner; the epoch lives until the next setgate1 or process restart.
++    Local dict is also cleared for the calling process."""
++    async with _gate_cache_lock:
++        _GATE_CACHE["value"] = None
++        _GATE_CACHE["id"] = None
++        _GATE_CACHE["ts"] = 0
++        _GATE_CACHE.pop("epoch", None)
++    try:
++        from modules.tokens import _get_redis_tok
++        r = await _get_redis_tok()
++        await r.incr(GATE_EPOCH_KEY)
++    except Exception:
++        pass
++
+ async def _get_cached_gate(db):
+     now = time.time()
++    # Multi-process coherence: any change (or absence) of the shared
++    # epoch forces a reload. No soft TTL is used for coherence.
++    try:
++        from modules.tokens import _get_redis_tok
++        r = await _get_redis_tok()
++        epoch = await r.get(GATE_EPOCH_KEY)
++        local_epoch = _GATE_CACHE.get("epoch")
++        if epoch is None or local_epoch != epoch:
++            async with _gate_cache_lock:
++                _GATE_CACHE["value"] = None
++                _GATE_CACHE["id"] = None
++                _GATE_CACHE["ts"] = 0
++                if epoch is not None:
++                    _GATE_CACHE["epoch"] = epoch
++    except Exception:
++        pass
+     if _GATE_CACHE["id"] and (now - _GATE_CACHE["ts"] < CACHE_TTL_GATE):
+         return _GATE_CACHE["id"]
+     gate = await db.get(Setting, "gate1_channel")
+     val = gate.value if gate else None
+     if val:
+         try:
+             async with tg_semaphore:
+                 chat = await app.get_chat(val)
+                 _GATE_CACHE["id"] = chat.id
+         except Exception:
+             _GATE_CACHE["id"] = val
+     _GATE_CACHE["value"] = val
+     _GATE_CACHE["ts"] = now
+     return _GATE_CACHE["id"]
+ async def check_gate(client, uid):
+     async with SessionLocal() as db:
+         gate_id = await _get_cached_gate(db)
+         if not gate_id:
+             return False
+     now = time.time()
+     key = (gate_id, uid)
+     # Positive results are NEVER served from cache.
+     # Only a recent explicit "left" may short-circuit to False.
+     async with _chatmem_cache_lock:
+         if key in _CHATMEM_CACHE:
+             status, ts = _CHATMEM_CACHE[key]
+             if status == "left" and (now - ts) < 5:
+                 return False
+             _CHATMEM_CACHE.pop(key, None)
+     try:
+         async with tg_semaphore:
+             member = await client.get_chat_member(gate_id, uid)
+         status = member.status
+         async with _chatmem_cache_lock:
+             _chatmem_set(key, status, now)
+         return status in ["member", "administrator", "creator"]
+     except Exception:
+         # Transient network errors must NEVER be cached as “left”.
+         # Deny this call but do not poison the cache.
+         return False
+ @app.on_message(filters.command("setgate1") & filters.user(ADMIN_IDS))
+ async def set_gate(client, m):
+     channel = m.text.split()[1]
+     async with SessionLocal() as db:
+         async with db.begin():
+             await db.merge(Setting(key="gate1_channel", value=channel))
+- async with _gate_cache_lock:
+- _GATE_CACHE["value"] = None
+- _GATE_CACHE["id"] = None
+- _GATE_CACHE["ts"] = 0
++    await invalidate_gate_cache()
+     await send_message(client, m.chat.id, "Gate1 set")
+ --- a/modules/webhook_server.py
++++ b/modules/webhook_server.py
+@@ -XX,XX +XX,XX @@ async def alby_webhook(request):
+     # ... signature / json parsing unchanged ...
+     payment_id_for_redis = None
+     uid_for_notify = None
+     tokens_to_credit = 0
++    action_token = None
++    locked_uid = None
++
++    from modules.tokens import acquire_action_lock, release_action_lock
++
++    # Resolve the uid first (read-only) so we can acquire the shared
++    # action lock *before* entering the SERIALIZABLE credit transaction.
++    # Fail-closed: contention returns None; Redis error raises and is
++    # turned into a 200 so Alby will redeliver / boot janitor recovers.
++    try:
++        async with SessionLocal() as lookup_db:
++            res = await lookup_db.execute(
++                select(Payment.uid)
++                .where(
++                    or_(
++                        Payment.invoice_id == invoice_id,
++                        Payment.client_ref == client_ref,
++                    )
++                )
++            )
++            locked_uid = res.scalar_one_or_none()
++    except Exception:
++        locked_uid = None
++
++    if locked_uid is not None:
++        try:
++            action_token = await acquire_action_lock(locked_uid)
++        except RuntimeError:
++            # Redis unavailable – leave for next delivery or boot janitor.
++            return web.Response(status=200, text="ok")
++        if action_token is None:
++            # Contention – another mutation holds the lock.
++            return web.Response(status=200, text="ok")
++
+     try:
+         async with SessionLocal() as db:
+             try:
+                 async with db.begin():
+                     # Audit (idempotent)
+                     await db.execute(text("""
+                         INSERT INTO payment_webhook_events (invoice_id, client_ref, payload, received_at)
+                         VALUES (:inv, :ref, :payload, :ts)
+                         ON CONFLICT (invoice_id) DO NOTHING
+                     """), {
+                         "inv": invoice_id,
+                         "ref": client_ref,
+                         "payload": json.dumps(data),
+                         "ts": datetime.now(timezone.utc),
+                     })
+                     # True SERIALIZABLE for the credit decision
+                     await db.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+                     stmt = (
+                         select(Payment)
+                         .where(
+                             or_(
+                                 Payment.invoice_id == invoice_id,
+                                 Payment.client_ref == client_ref,
+                             )
+                         )
+                         .with_for_update()
+                     )
+                     res = await db.execute(stmt)
+                     payment = res.scalar_one_or_none()
+                     if not payment or payment.tokens_credited:
+                         return web.Response(status=200, text="ok")
+                     if payment.payment_version not in (1, 2, 4) or payment.paid:
+                         return web.Response(status=200, text="ok")
+                     ok = await add_tokens(
+                         payment.uid,
+                         payment.tokens,
+                         payment_id=payment.id,
+                         reason='recovery',
+                         db=db,
+                         invoice_id=invoice_id,
+                         payment_request=getattr(payment, "payment_request", None),
+                         expires_at=getattr(payment, "expires_at", None),
+                     )
+                     if not ok:
+                         raise RuntimeError("add_tokens failed – leave for boot janitor")
+                     payment_id_for_redis = payment.id
+                     uid_for_notify = payment.uid
+                     tokens_to_credit = payment.tokens
+             except Exception as e:
+                 log.error("webhook credit transaction failed for inv %s ref %s: %s",
+                           invoice_id, client_ref, e)
+                 return web.Response(status=200, text="ok")
+     finally:
+         if action_token is not None and locked_uid is not None:
+             try:
+                 await release_action_lock(locked_uid, action_token)
+             except Exception:
+                 pass
+     if uid_for_notify and payment_id_for_redis:
+         asyncio.create_task(_send_notify_messages(uid_for_notify, tokens_to_credit))
+         try:
+             r = await _get_redis()
+             await r.set(f"vip:side:payment:{payment_id_for_redis}", "1",
+                         nx=True, ex=IDEMPOTENCY_TTL)
+         except Exception:
+             pass
+     return web.Response(status=200, text="ok")
+
+
+
+I WANT YOU TO CHECK IF BELOW BUG ( TIMEZONE / DATETIME AWARENESS MISMATCHES) EXISTS ONLY AFTER APPLYING ALL THE  PATCHES ABOVE SEQUENTIALLY.(FROM PATCH 1-38)
+
+1.TIMEZONE / DATETIME AWARENESS MISMATCHES
+  Some modules use datetime.now(timezone.utc), others use func.now() (DB server time), others use naive datetime.
+  package_end comparisons mix aware and naive; can raise TypeError or silently compare wrong.
+  MODULE 15/16 referral expiry uses fromisoformat without always guaranteeing tzinfo.
+  MODULE 26 OVERSTAY_MAX_SEC / INACTIVITY_DELETE_SEC windows use aware now but last_activity may be stored as naive depending on column default.
+  invoice_lock_until and expires_at are compared without consistent tz.
 
 
 WARNING!!THIS IS A DRY RUN, SPECULATIVE EXECUTION, PREFLIGHT VALIDATION, WE ARE TESTING THE PATCH BELOW  IF IT WILL APPLY CLEANLY TO CODEBASE WITHOUT MODIFYING ACTIVE PROJECT FILES. MY COMPILED CODE HAS NOT BEEN PATCHED YET, THE PATCH IS A SUGESTION OF WHAT I SHOULD DO
 
-IF THE BUG (REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES) EXISTS:
+IF THE BUG (TIMEZONE / DATETIME AWARENESS MISMATCHES) EXISTS:
 
-DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND  CHECK PROVIDED  MITIGATION PATCH IF IT FOLLOWS BELOW RULES 100% UNCONDITIONALY
+DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND PROVIDE A  MITIGATION PATCH THAT FOLLOWS BELOW RULES 100% UNCONDITIONALY
 
-1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE PATCHES ABOVE SEQUENTIALLY FROM PATCH 1-37 TO THE EXISTING COMPILED MODULE.
-2.IT SHOULD CLOSE THE ( REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
-3.IT SHOULD ONLY ALTER CODE THAT  (REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
+1.THE MITIGATION SHOULD HAVE BEEN PRE VALIDATED ONLY AFTER APPLYING THE PATCHES ABOVE SEQUENTIALLY FROM PATCH 1-38 TO THE EXISTING COMPILED MODULE.
+2.IT SHOULD CLOSE THE ( TIMEZONE / DATETIME AWARENESS MISMATCHES) bug (if it exists) 100% LEAVING NO REMAINING EDGE CASES ARISING FROM THAT  PATCH
+3.IT SHOULD ONLY ALTER CODE THAT  (TIMEZONE / DATETIME AWARENESS MISMATCHES) BUG (If it exists) Alters.  NO OTHER UNRELATED CODE SHOULD BE ALTERED
 4.NO RUNTIME CRONS/CLEANERS/PERIODIC SCHEDULER ONLY ONE BOOT JANITOR THAT CAN RECOVER THE SYSYEM IN WHATEVER STATE IT WAS BEFORE FULL BOT OUTAGE
 5.LET THE SYTEM HANDLE ITSELF IF THERE IS A TIMEOUT, ERROR, CRASH 
 6.IF A PROCESS CANT HANDLE ITSELF DURING UPTIME THEN IT SHOULD BE HANDLED BY BOOT RWECOVERY DURING A FULL BOT RESTART
-7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES) bug (if it exists) NO OTHER CASES
+7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( TIMEZONE / DATETIME AWARENESS MISMATCHES) bug (if it exists) NO OTHER CASES
 
 
-WHEN CRAFTING THE PATCH TAKE INTO CONSIDERATION THE METHODS YOU HAD PREVIOUSLY IMPLEMENTED BELOW AND FAILED TO MEET THE 7 RULES ABOVE.
-1.except Exception: pass / return None inside acquire_action_lock and the webhook “if action_token is None: return 200”
-2.On Redis failure the acquisition must fail closed (raise or return a sentinel that aborts the mutation). Never fall through to the unlocked path.
-3.The entire rewritten body of activate_package (the OCC loop, pending-payment count, is_user_locked_for_buy call, etc.)Leave the post-1–37 body of activate_package untouched. Only add a one-line comment that the caller already holds the action lock, and delete the now-redundant if await is_user_locked_for_buy\ldots check.3, 7
-4.Turning lock_user_for_buy / unlock_user_for_buy into permanent no-ops and leaving the dead functionsKeep the original functions; they are already ignored at runtime after earlier patches. Do not alter them.2
-5.Gate-epoch soft TTL of 86400 + local TTL still presentKeep the epoch, but force a reload on every _get_cached_gate when the epoch is absent or different; do not rely on a soft TTL for coherence.
-6.Negative chatmem still written on any exceptionThe except path in check_gate must never call _chatmem_set (already true after Patch 30); reinforce that no negative entry is ever stored for a network error.
-7.acquire_action_lock: except Exception: return None → raise RuntimeError(...). Satisfies rule 2 (fail-closed by exception) and removes the previously-rejected silent-None path.
-8.uid_lock wrapper: added try/except RuntimeError around the acquire so a Redis outage surfaces as a user-visible “Service busy” instead of an unhandled exception.
-9.activate_package: deleted both occurrences of if await is_user_locked_for_buy\ldots. The post-1–37 OCC body is otherwise untouched; only the one-line comment that the caller already holds the action lock remains. Removes the residual third locking mechanism and satisfies the prior guidance.
-10._get_cached_gate: epoch check now forces a reload when the key is absent or different. Removes reliance on a soft TTL for multi-process coherence.
-11.Webhook: Redis failure now raises (caught and turned into 200) while pure contention still returns 200; the previously-rejected “if action_token is None: return 200” pattern is retained only for the contention case, which is the correct non-error path.
-
-
-WARNING!! DO NOT RESEND THE PATCH IF ALL 7 RULES ARE FOLLOWED AND THERE IS LITERALLY ZERO CODE CHANGE FROM WHAT I HAVE BELOW
-                   
-IF THE PATCH BELOW DOES NOT FOLLOW ALL 7 RULES  TELL ME EXACTLY WHAT RULE HAS BEEN BROKEN, STATE THE EXACT CODE FROM THE PATCH BELOW AND WHAT NEEDS TO CHANGE FROM THE PATCH BELOW , THEN UPDATE IT AND RESEND THE PATCH,DO NOT USE PLACEHOLDERS LIKE "KEEP PREVIOUS PATCH SUGGESTION"AND DO NOT PUT REFERENCE TO OLD CODE FROM THE OLD PATCH THAT I DISCARDED ENTIRELY.AND AFTER GENERATING NEW PATCH STATE EXACT CODE LINES  THAT CHANGED FROM PREVIOUS PATCH BELOW AND WHY
-
-WRITE OUT THE  UPDATED PATCH FULLY EVEN  WITH THE CODE  THAT DID NOT CHANGE FROM PREVIOUS PATCH BELOW
 
