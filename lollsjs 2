@@ -9331,9 +9331,23 @@ DO A FULL RIGOROUS IN DEPTH ANALSYSIS AND REVIEW AND  CHECK PROVIDED  MITIGATION
 7.THE MITIGATION SHOULD EXPLCILTY FIX ONLY THE ( REDIS / IN-MEMORY LOCK & CACHE DIVERGENCE + GATE / MEMBERSHIP CACHE RACES) bug (if it exists) NO OTHER CASES
 
 
+WHEN CRAFTING THE PATCH TAKE INTO CONSIDERATION THE METHODS YOU HAD PREVIOUSLY IMPLEMENTED BELOW AND FAILED TO MEET THE 7 RULES ABOVE.
+1.except Exception: pass / return None inside acquire_action_lock and the webhook “if action_token is None: return 200”
+2.On Redis failure the acquisition must fail closed (raise or return a sentinel that aborts the mutation). Never fall through to the unlocked path.
+3.The entire rewritten body of activate_package (the OCC loop, pending-payment count, is_user_locked_for_buy call, etc.)Leave the post-1–37 body of activate_package untouched. Only add a one-line comment that the caller already holds the action lock, and delete the now-redundant if await is_user_locked_for_buy\ldots check.3, 7
+4.Turning lock_user_for_buy / unlock_user_for_buy into permanent no-ops and leaving the dead functionsKeep the original functions; they are already ignored at runtime after earlier patches. Do not alter them.2
+5.Gate-epoch soft TTL of 86400 + local TTL still presentKeep the epoch, but force a reload on every _get_cached_gate when the epoch is absent or different; do not rely on a soft TTL for coherence.
+6.Negative chatmem still written on any exceptionThe except path in check_gate must never call _chatmem_set (already true after Patch 30); reinforce that no negative entry is ever stored for a network error.
+7.acquire_action_lock: except Exception: return None → raise RuntimeError(...). Satisfies rule 2 (fail-closed by exception) and removes the previously-rejected silent-None path.
+8.uid_lock wrapper: added try/except RuntimeError around the acquire so a Redis outage surfaces as a user-visible “Service busy” instead of an unhandled exception.
+9.activate_package: deleted both occurrences of if await is_user_locked_for_buy\ldots. The post-1–37 OCC body is otherwise untouched; only the one-line comment that the caller already holds the action lock remains. Removes the residual third locking mechanism and satisfies the prior guidance.
+10._get_cached_gate: epoch check now forces a reload when the key is absent or different. Removes reliance on a soft TTL for multi-process coherence.
+11.Webhook: Redis failure now raises (caught and turned into 200) while pure contention still returns 200; the previously-rejected “if action_token is None: return 200” pattern is retained only for the contention case, which is the correct non-error path.
+
+
 WARNING!! DO NOT RESEND THE PATCH IF ALL 7 RULES ARE FOLLOWED AND THERE IS LITERALLY ZERO CODE CHANGE FROM WHAT I HAVE BELOW
                    
-IF THE PATCH BELOW DOES NOT FOLLOW ALL 7 RULES  TELL ME EXACTLY WHAT RULE HAS BEEN BROKEN, STATE THE EXACT CODE FROM THE PATCH BELOW AND WHAT NEEDS TO CHANGE FROM THE PATCH BELOW , THEN UPDATE IT AND RESEND THE PATCH,DO NOT USE PLACEHOLDERS LIKE "KEEP PREVIOUS PATCH SUGGESTION"AND DO NOT PUT REFERENCE TO OLD CODE FROM THE OLD PATCH THAT I DISCARDED ENTIRELY.AND AFTER GENERATING NEW PATCH STATE EXACT CODE LINES  THAT CHANGED FROM PREVIOUS PATCH BELOW
+IF THE PATCH BELOW DOES NOT FOLLOW ALL 7 RULES  TELL ME EXACTLY WHAT RULE HAS BEEN BROKEN, STATE THE EXACT CODE FROM THE PATCH BELOW AND WHAT NEEDS TO CHANGE FROM THE PATCH BELOW , THEN UPDATE IT AND RESEND THE PATCH,DO NOT USE PLACEHOLDERS LIKE "KEEP PREVIOUS PATCH SUGGESTION"AND DO NOT PUT REFERENCE TO OLD CODE FROM THE OLD PATCH THAT I DISCARDED ENTIRELY.AND AFTER GENERATING NEW PATCH STATE EXACT CODE LINES  THAT CHANGED FROM PREVIOUS PATCH BELOW AND WHY
 
 WRITE OUT THE  UPDATED PATCH FULLY EVEN  WITH THE CODE  THAT DID NOT CHANGE FROM PREVIOUS PATCH BELOW
 
